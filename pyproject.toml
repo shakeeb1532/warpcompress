@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warpcompress"
+version = "1.0.0"
+description = "Massive-file-ready lossless compression with scatter-gather mmap decompression, throughput mode, and integrity footer."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "WarpCompress maintainers"}]
+requires-python = ">=3.9"
+dependencies = [
+    "lz4>=4.3.3",
+    "zstandard>=0.22.0",
+    "python-snappy>=0.7.1",
+    "brotli>=1.0.9",
+]
+
+[project.optional-dependencies]
+hashes = [
+    "blake3>=0.4.1",
+    "xxhash>=3.4.1",
+]
+
+[project.scripts]
+warp-compress = "warpcompress.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+python_files = "test_*.py"
