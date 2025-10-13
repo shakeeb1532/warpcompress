@@ -6,6 +6,8 @@ WarpCompress — Scalable, parallel, lossless compressor/decompressor.
 - Reader supports v2 and v1. v2 enables parallel scatter-gather mmap writes;
   v1 falls back to streamed sequential writes (still constant RAM).
 - Throughput mode, integrity footer, and verbose per-chunk timings included.
+- Performance (1.0.1): Zstd zero-copy decompress_into, thread-local dctx reuse,
+  and MADV hints for input/output mmaps.
 """
 from __future__ import annotations
 
@@ -17,6 +19,8 @@ import struct
 import sys
 import time
 from typing import Iterable, List, Sequence, Tuple, Optional
+import threading
+import hashlib
 
 try:
     import lz4.frame
@@ -27,6 +31,7 @@ except ImportError:
     print("Error: Required libs missing. Install: pip install lz4 zstandard python-snappy brotli", file=sys.stderr)
     raise
 
+# Optional hash libs
 try:
     import blake3; _has_blake3 = True
 except Exception:
@@ -35,7 +40,14 @@ try:
     import xxhash; _has_xxhash = True
 except Exception:
     _has_xxhash = False
-import hashlib
+
+# --------- Thread-local zstd dctx ---------
+_tlocal = threading.local()
+def _get_zstd_dctx():
+    """Return a thread-local ZstdDecompressor (reuse across chunks)."""
+    if not hasattr(_tlocal, "zstd_dctx"):
+        _tlocal.zstd_dctx = zstd.ZstdDecompressor()
+    return _tlocal.zstd_dctx
 
 # --------- Format & constants ---------
 MAGIC_NUMBER = 0x57415250  # "WARP"
@@ -70,6 +82,9 @@ def _pack_header_v1(algorithm_id: int, orig_size: int, comp_sizes: Sequence[int]
     return head + comp_bin
 
 def _unpack_header(f) -> Tuple[int, int, int, List[int], Optional[List[int]], int, int]:
+    """
+    Returns: (algo_id, orig_size, num_chunks, comp_sizes, decomp_sizes_or_None, data_start_offset, version)
+    """
     fixed_len = struct.calcsize("<L B B Q L")
     fixed = f.read(fixed_len)
     if len(fixed) != fixed_len:
@@ -154,6 +169,7 @@ def _auto_choose_algorithm(sample: bytes, zstd_level: int) -> int:
     return ALGO_ZSTD if len(zstd_c) <= len(snp_c) * 0.90 else ALGO_SNAPPY
 
 def _throughput_plan(file_size: int, cpu_cores: int) -> Tuple[int, int, int, int]:
+    """Return (chunk_size, host_threads, zstd_threads, algorithm_id) tuned for wall-clock throughput."""
     MiB = 1024 * 1024; GiB = 1024 * MiB; cores = max(1, cpu_cores)
     if file_size < 256 * MiB:
         return 2 * MiB, min(4, cores), 0, (ALGO_LZ4 if file_size >= 32 * MiB else ALGO_SNAPPY)
@@ -194,11 +210,30 @@ class CompressionManager:
             print(f"[compress] chunk {i:5d}: {len(view)/1e6:8.2f}MB → {len(out)/1e6:8.2f}MB | {mbps:8.2f} MB/s")
         return i, out, view
 
-    def _decompress_job(self, args: Tuple[int, memoryview, int]) -> Tuple[int, bytes]:
-        i, view, algo = args
+    def _decompress_job(self, args: Tuple[int, memoryview, int, Optional[Tuple[int, int, mmap.mmap]]]) -> Tuple[int, int | bytes]:
+        """
+        Decompress one chunk.
+        If a destination slice is provided (v2 + zstd), write directly into mm_out[start:end]
+        and return (i, written_len). Otherwise, return (i, bytes) for caller to write.
+        """
+        i, view, algo, dest = args
         t0 = time.perf_counter()
+
+        # Fast path: Zstd can decompress directly into destination buffer
+        if algo == ALGO_ZSTD and dest is not None:
+            start, end, mm_out = dest
+            dctx = _get_zstd_dctx()
+            dst = memoryview(mm_out)[start:end]
+            written = dctx.decompress_into(dst, view)
+            t1 = time.perf_counter()
+            if self.verbose:
+                mbps = (written / (1024 * 1024)) / max(1e-9, (t1 - t0))
+                print(f"[decomp ] chunk {i:5d}: {len(view)/1e6:8.2f}MB → {written/1e6:8.2f}MB | {mbps:8.2f} MB/s (into)")
+            return i, written
+
+        # Fallback: allocate an intermediate object
         if algo == ALGO_ZSTD:
-            out = zstd.ZstdDecompressor().decompress(view)
+            out = _get_zstd_dctx().decompress(view)
         elif algo == ALGO_LZ4:
             out = lz4.frame.decompress(view)
         elif algo == ALGO_SNAPPY:
@@ -207,6 +242,7 @@ class CompressionManager:
             out = brotli.decompress(view)
         else:
             raise ValueError(f"Unknown algo id: {algo}")
+
         t1 = time.perf_counter()
         if self.verbose:
             mbps = (len(out) / (1024 * 1024)) / max(1e-9, (t1 - t0))
@@ -275,6 +311,13 @@ class CompressionManager:
                 with open(output_filename, "wb"): pass
                 return
 
+            # I/O hints to kernel
+            try:
+                mm_in.madvise(mmap.MADV_SEQUENTIAL)  # type: ignore[attr-defined]
+                mm_in.madvise(mmap.MADV_WILLNEED)    # type: ignore[attr-defined]
+            except Exception:
+                pass
+
             payload_len = sum(comp_sizes)
             footer = _unpack_footer(mm_in, data_start + payload_len)
 
@@ -286,37 +329,49 @@ class CompressionManager:
             with open(output_filename, "w+b") as f_out:
                 f_out.truncate(orig_size)
                 with mmap.mmap(f_out.fileno(), 0, access=mmap.ACCESS_WRITE) as mm_out:
+                    try:
+                        mm_out.madvise(mmap.MADV_SEQUENTIAL)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+
                     if ver == 2 and decomp_sizes is not None:
+                        # prefix sums → per-chunk offsets
                         offsets = [0] * num_chunks
                         acc = 0
                         for i, sz in enumerate(decomp_sizes):
                             offsets[i] = acc; acc += sz
 
-                        def worker(args):
-                            i, view, algo_local = args
-                            i2, out = self._decompress_job((i, view, algo_local))
-                            exp = decomp_sizes[i2]
-                            if len(out) != exp:
-                                raise ValueError("Decompressed chunk size mismatch (corrupt?).")
-                            start = offsets[i2]; end = start + exp
-                            mm_out[start:end] = out
-                            return i2
+                        def task(i_view):
+                            i, view = i_view
+                            start = offsets[i]
+                            end   = start + decomp_sizes[i]
+                            if algo == ALGO_ZSTD:
+                                # zero-copy into the output slice
+                                return self._decompress_job((i, view, algo, (start, end, mm_out)))
+                            else:
+                                # one allocation, then copy to the slice
+                                i2, out = self._decompress_job((i, view, algo, None))
+                                mv = memoryview(mm_out)[start:start+len(out)]
+                                mv[:] = out
+                                return i2, len(out)
 
-                        if num_chunks == 1 or DEFAULT_THREADS == 1:
+                        if num_chunks == 1 or self.threads == 1:
                             for i, view in enumerate(comp_views):
-                                worker((i, view, algo))
+                                task((i, view))
                         else:
                             with cf.ThreadPoolExecutor(max_workers=self.threads) as ex:
-                                for _ in ex.map(worker, [(i, v, algo) for i, v in enumerate(comp_views)], chunksize=1):
+                                for _ in ex.map(task, enumerate(comp_views), chunksize=1):
                                     pass
                     else:
+                        # v1: stream sequentially to output (constant RAM)
                         write_off = 0
                         for i, view in enumerate(comp_views):
-                            _, out = self._decompress_job((i, view, algo))
+                            _, out = self._decompress_job((i, view, algo, None))
                             end = write_off + len(out)
                             mm_out[write_off:end] = out
                             write_off = end
 
+            # Optional integrity verification
             if footer:
                 hash_algo_id, digest_expected = footer
                 hasher = _Hasher(hash_algo_id)
@@ -355,3 +410,4 @@ def _build_argparser() -> argparse.ArgumentParser:
     sp_d = sub.add_parser("decompress", help="Decompress a .warp file.")
     add_common(sp_d)
     return p
+
