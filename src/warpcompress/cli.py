@@ -19,10 +19,11 @@ def main() -> None:
 
     t0 = time.perf_counter()
     if args.mode == "compress":
-        print(f"Compressing {args.input_file} → {args.output_file} (level={args.level}) …")
+        print(f"Compressing {args.input_file} \u2192 {args.output_file} (level={args.level}) …")
         cm.compress_file(args.input_file, args.output_file, level=args.level)
     else:
-        print(f"Decompressing {args.input_file} → {args.output_file} …")
+        print(f"Decompressing {args.input_file} \u2192 {args.output_file} …")
         cm.decompress_file(args.input_file, args.output_file)
     dt = time.perf_counter() - t0
     print(f"Done in {dt:.3f}s.")
+
