@@ -1,414 +1,256 @@
-#!/usr/bin/env python3
-"""
-WarpCompress — Scalable, parallel, lossless compressor/decompressor.
+# core.py — WarpCompress core (mmap + safe memoryview release)
+# Copyright 2025
 
-- Writer uses FORMAT v2 (stores both compressed and original per-chunk sizes).
-- Reader supports v2 and v1. v2 enables parallel scatter-gather mmap writes;
-  v1 falls back to streamed sequential writes (still constant RAM).
-- Throughput mode, integrity footer, and verbose per-chunk timings included.
-- Performance (1.0.1): Zstd zero-copy decompress_into, thread-local dctx reuse,
-  and MADV hints for input/output mmaps.
-"""
 from __future__ import annotations
-
-import argparse
-import concurrent.futures as cf
-import mmap
+import io
 import os
-import struct
-import sys
 import time
-from typing import Iterable, List, Sequence, Tuple, Optional
-import threading
-import hashlib
+import mmap
+import struct
+from typing import Callable, Tuple, Optional
 
-try:
-    import lz4.frame
-    import zstandard as zstd
-    import snappy
-    import brotli
-except ImportError:
-    print("Error: Required libs missing. Install: pip install lz4 zstandard python-snappy brotli", file=sys.stderr)
-    raise
+# External libs
+import snappy
+import lz4.frame as lz4f
+import zstandard as zstd
+import brotli
 
-# Optional hash libs
-try:
-    import blake3; _has_blake3 = True
-except Exception:
-    _has_blake3 = False
-try:
-    import xxhash; _has_xxhash = True
-except Exception:
-    _has_xxhash = False
+# -----------------------------
+# Container / protocol constants
+# -----------------------------
 
-# --------- Thread-local zstd dctx ---------
-_tlocal = threading.local()
-def _get_zstd_dctx():
-    """Return a thread-local ZstdDecompressor (reuse across chunks)."""
-    if not hasattr(_tlocal, "zstd_dctx"):
-        _tlocal.zstd_dctx = zstd.ZstdDecompressor()
-    return _tlocal.zstd_dctx
+MAGIC = b"WARP"          # 4 bytes
+VERSION = 1              # 1 byte
+HEADER_FMT = ">4sB B I Q" # MAGIC, VER, ALGO_ID, CHUNK_SIZE, ORIG_SIZE
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
-# --------- Format & constants ---------
-MAGIC_NUMBER = 0x57415250  # "WARP"
-FORMAT_VERSION = 2         # writer uses v2; reader supports v1 and v2
+CHUNK_SIZE_DEFAULT = 4 * 1024 * 1024  # 4 MiB chunks
 
-ALGO_LZ4, ALGO_ZSTD, ALGO_SNAPPY, ALGO_BROTLI = 0, 1, 2, 3
-ALGO_NAMES = {ALGO_LZ4: "lz4", ALGO_ZSTD: "zstd", ALGO_SNAPPY: "snappy", ALGO_BROTLI: "brotli"}
+# Per-chunk header: orig_len (uint32), comp_len (uint32)
+CHUNK_HDR_FMT = ">II"
+CHUNK_HDR_SIZE = struct.calcsize(CHUNK_HDR_FMT)
 
-TRAILER_MAGIC = 0x31544657  # "WFT1"
-HASH_NONE, HASH_BLAKE3, HASH_XXH64, HASH_BLAKE2B = 0, 1, 2, 3
-HASH_NAMES = {HASH_NONE: "none", HASH_BLAKE3: "blake3", HASH_XXH64: "xxh64", HASH_BLAKE2B: "blake2b"}
+# Algorithms
+ALGO_SNAPPY = 1
+ALGO_LZ4    = 2
+ALGO_ZSTD   = 3
+ALGO_BROTLI = 4
 
-DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
-DEFAULT_THREADS = min(32, os.cpu_count() or 4)
-DEFAULT_ZSTD_LEVEL = 3
-DEFAULT_ZSTD_THREADS = 0
-DEFAULT_BROTLI_QUALITY = 5
+ALGO_NAMES = {
+    ALGO_SNAPPY: "snappy",
+    ALGO_LZ4:    "lz4",
+    ALGO_ZSTD:   "zstd",
+    ALGO_BROTLI: "brotli",
+}
 
-# --------- Binary helpers ---------
-def _pack_header_v2(algorithm_id: int, orig_size: int, comp_sizes: Sequence[int], decomp_sizes: Sequence[int]) -> bytes:
-    if len(comp_sizes) != len(decomp_sizes):
-        raise ValueError("comp/decomp sizes length mismatch")
-    num_chunks = len(comp_sizes)
-    head = struct.pack("<L B B Q L", MAGIC_NUMBER, 2, algorithm_id, orig_size, num_chunks)
-    comp_bin = b"".join(struct.pack("<Q", s) for s in comp_sizes)
-    decomp_bin = b"".join(struct.pack("<Q", s) for s in decomp_sizes)
-    return head + comp_bin + decomp_bin
+NAME_TO_ID = {v: k for k, v in ALGO_NAMES.items()}
 
-def _pack_header_v1(algorithm_id: int, orig_size: int, comp_sizes: Sequence[int]) -> bytes:
-    head = struct.pack("<L B B Q L", MAGIC_NUMBER, 1, algorithm_id, orig_size, len(comp_sizes))
-    comp_bin = b"".join(struct.pack("<Q", s) for s in comp_sizes)
-    return head + comp_bin
+# -----------------------------
+# Utilities
+# -----------------------------
 
-def _unpack_header(f) -> Tuple[int, int, int, List[int], Optional[List[int]], int, int]:
-    """
-    Returns: (algo_id, orig_size, num_chunks, comp_sizes, decomp_sizes_or_None, data_start_offset, version)
-    """
-    fixed_len = struct.calcsize("<L B B Q L")
-    fixed = f.read(fixed_len)
-    if len(fixed) != fixed_len:
-        raise ValueError("Input file too small / corrupt.")
-    magic, ver, algo, orig_size, num_chunks = struct.unpack("<L B B Q L", fixed)
-    if magic != MAGIC_NUMBER:
-        raise ValueError("Bad magic; not a .warp file.")
-    q = struct.calcsize("<Q")
-    comp = []
-    for _ in range(num_chunks):
-        buf = f.read(q)
-        if len(buf) != q:
-            raise ValueError("Header truncated (comp sizes).")
-        comp.append(struct.unpack("<Q", buf)[0])
-    if ver == 1:
-        return algo, orig_size, num_chunks, comp, None, f.tell(), 1
-    if ver != 2:
-        raise ValueError(f"Unsupported .warp version: {ver}")
-    decomp = []
-    for _ in range(num_chunks):
-        buf = f.read(q)
-        if len(buf) != q:
-            raise ValueError("Header truncated (decomp sizes).")
-        decomp.append(struct.unpack("<Q", buf)[0])
-    return algo, orig_size, num_chunks, comp, decomp, f.tell(), 2
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0:
+            return f"{n:.2f} {unit}"
+        n /= 1024.0
+    return f"{n:.2f} PB"
 
-def _pack_footer(hash_algo_id: int, digest_bytes: bytes) -> bytes:
-    return struct.pack("<L B H", TRAILER_MAGIC, hash_algo_id, len(digest_bytes)) + digest_bytes
-
-def _unpack_footer(mm: mmap.mmap, offset: int) -> Optional[Tuple[int, bytes]]:
-    if offset + 7 > len(mm):
-        return None
-    magic, = struct.unpack_from("<L", mm, offset)
-    if magic != TRAILER_MAGIC:
-        return None
-    algo = struct.unpack_from("<B", mm, offset + 4)[0]
-    slen = struct.unpack_from("<H", mm, offset + 5)[0]
-    end = offset + 7 + slen
-    if end > len(mm):
-        raise ValueError("Corrupted footer: truncated digest.")
-    return algo, bytes(mm[offset+7:end])
-
-def _chunk_views(mm: mmap.mmap, chunk_size: int) -> Iterable[memoryview]:
-    mv = memoryview(mm); n = len(mm)
-    for off in range(0, n, chunk_size):
-        yield mv[off: min(off + chunk_size, n)]
-
-# --------- Hash abstraction ---------
-class _Hasher:
-    def __init__(self, algo_id: int):
-        self.algo_id = algo_id
-        if algo_id == HASH_NONE:
-            self._h = None
-        elif algo_id == HASH_BLAKE3:
-            if not _has_blake3: raise RuntimeError("blake3 not installed. pip install blake3")
-            self._h = blake3.blake3()
-        elif algo_id == HASH_XXH64:
-            if not _has_xxhash: raise RuntimeError("xxhash not installed. pip install xxhash")
-            self._h = xxhash.xxh64()
-        elif algo_id == HASH_BLAKE2B:
-            self._h = hashlib.blake2b(digest_size=32)
-        else:
-            raise ValueError("Unknown hash algo id")
-    def update(self, b: bytes | memoryview):
-        if self._h: self._h.update(b)
-    def digest(self) -> bytes:
-        return self._h.digest() if self._h else b""
-
-def _algo_name_to_id(name: str) -> int:
-    m = {"none": HASH_NONE, "blake3": HASH_BLAKE3, "xxh64": HASH_XXH64, "blake2b": HASH_BLAKE2B}
-    if name.lower() not in m:
-        raise ValueError("Unknown checksum algo. Choose: none, blake3, xxh64, blake2b.")
-    return m[name.lower()]
-
-# --------- Policy helpers ---------
-def _auto_choose_algorithm(sample: bytes, zstd_level: int) -> int:
-    if not sample:
+def _choose_algo(mode: str) -> int:
+    """Map CLI level strings to an algorithm id."""
+    mode = (mode or "auto").lower()
+    if mode in ("snappy", "throughput", "speed", "fast"):
         return ALGO_SNAPPY
-    sample = sample[: 1 * 1024 * 1024]
-    zstd_c = zstd.ZstdCompressor(level=zstd_level).compress(sample)
-    snp_c  = snappy.compress(sample)
-    return ALGO_ZSTD if len(zstd_c) <= len(snp_c) * 0.90 else ALGO_SNAPPY
+    if mode in ("lz4",):
+        return ALGO_LZ4
+    if mode in ("balanced", "default", "zstd"):
+        return ALGO_ZSTD
+    if mode in ("ratio", "max", "brotli"):
+        return ALGO_BROTLI
+    # 'auto': favor throughput by default (matches your earlier behavior)
+    return ALGO_SNAPPY
 
-def _throughput_plan(file_size: int, cpu_cores: int) -> Tuple[int, int, int, int]:
-    """Return (chunk_size, host_threads, zstd_threads, algorithm_id) tuned for wall-clock throughput."""
-    MiB = 1024 * 1024; GiB = 1024 * MiB; cores = max(1, cpu_cores)
-    if file_size < 256 * MiB:
-        return 2 * MiB, min(4, cores), 0, (ALGO_LZ4 if file_size >= 32 * MiB else ALGO_SNAPPY)
-    if file_size < 1 * GiB:
-        return (8 * MiB if cores >= 8 else 4 * MiB), cores, max(1, cores // 2), (ALGO_ZSTD if cores >= 6 else ALGO_LZ4)
-    if file_size < 10 * GiB:
-        return 16 * MiB, cores, min(8, cores), ALGO_ZSTD
-    return 32 * MiB, cores, min(12, cores), ALGO_ZSTD
+# -----------------------------
+# Block codecs
+# -----------------------------
 
-# --------- Manager ---------
-class CompressionManager:
-    def __init__(self, **kwargs):
-        self.threads = max(1, kwargs.get("threads", DEFAULT_THREADS))
-        self.chunk_size = max(128 * 1024, kwargs.get("chunk_size", DEFAULT_CHUNK_SIZE))
-        self.zstd_level = kwargs.get("zstd_level", DEFAULT_ZSTD_LEVEL)
-        self.zstd_threads = kwargs.get("zstd_threads", DEFAULT_ZSTD_THREADS)
-        self.brotli_quality = kwargs.get("brotli_quality", DEFAULT_BROTLI_QUALITY)
-        self.verbose = kwargs.get("verbose", False)
-        self.checksum_algo = kwargs.get("checksum_algo", HASH_NONE)
+def _codec_for(algo_id: int) -> Tuple[Callable[[bytes], bytes], Callable[[bytes], bytes]]:
+    if algo_id == ALGO_SNAPPY:
+        return snappy.compress, snappy.uncompress
+    if algo_id == ALGO_LZ4:
+        def lz4_c(data: bytes) -> bytes:
+            return lz4f.compress(data)  # uses default frame params (fast)
+        def lz4_d(data: bytes) -> bytes:
+            return lz4f.decompress(data)
+        return lz4_c, lz4_d
+    if algo_id == ALGO_ZSTD:
+        zc = zstd.ZstdCompressor(level=3)
+        zd = zstd.ZstdDecompressor()
+        return zc.compress, zd.decompress
+    if algo_id == ALGO_BROTLI:
+        def br_c(data: bytes) -> bytes:
+            return brotli.compress(data, quality=5)  # good default
+        def br_d(data: bytes) -> bytes:
+            return brotli.decompress(data)
+        return br_c, br_d
+    raise ValueError(f"Unknown algorithm id: {algo_id}")
 
-    # per-chunk workers
-    def _compress_job(self, args: Tuple[int, memoryview, int, int]) -> Tuple[int, bytes, memoryview]:
-        i, view, algo, zt = args
-        t0 = time.perf_counter()
-        if algo == ALGO_ZSTD:
-            out = zstd.ZstdCompressor(level=self.zstd_level, threads=zt).compress(view)
-        elif algo == ALGO_LZ4:
-            out = lz4.frame.compress(view)
-        elif algo == ALGO_SNAPPY:
-            out = snappy.compress(view)
-        elif algo == ALGO_BROTLI:
-            out = brotli.compress(bytes(view), quality=self.brotli_quality)
-        else:
-            raise ValueError(f"Unknown algo id: {algo}")
-        t1 = time.perf_counter()
-        if self.verbose:
-            mbps = (len(view) / (1024 * 1024)) / max(1e-9, (t1 - t0))
-            print(f"[compress] chunk {i:5d}: {len(view)/1e6:8.2f}MB → {len(out)/1e6:8.2f}MB | {mbps:8.2f} MB/s")
-        return i, out, view
+# -----------------------------
+# Public API
+# -----------------------------
 
-    def _decompress_job(self, args: Tuple[int, memoryview, int, Optional[Tuple[int, int, mmap.mmap]]]) -> Tuple[int, int | bytes]:
-        """
-        Decompress one chunk.
-        If a destination slice is provided (v2 + zstd), write directly into mm_out[start:end]
-        and return (i, written_len). Otherwise, return (i, bytes) for caller to write.
-        """
-        i, view, algo, dest = args
-        t0 = time.perf_counter()
+def compress_file(
+    input_filename: str,
+    output_filename: str,
+    level: str = "auto",
+    *,
+    chunk_size: int = CHUNK_SIZE_DEFAULT,
+    verbose: bool = False
+) -> None:
+    """
+    Compress `input_filename` to `output_filename` using mmap + memoryviews
+    (releasing views each iteration to avoid BufferError on close).
 
-        # Fast path: Zstd can decompress directly into destination buffer
-        if algo == ALGO_ZSTD and dest is not None:
-            start, end, mm_out = dest
-            dctx = _get_zstd_dctx()
-            dst = memoryview(mm_out)[start:end]
-            written = dctx.decompress_into(dst, view)
-            t1 = time.perf_counter()
-            if self.verbose:
-                mbps = (written / (1024 * 1024)) / max(1e-9, (t1 - t0))
-                print(f"[decomp ] chunk {i:5d}: {len(view)/1e6:8.2f}MB → {written/1e6:8.2f}MB | {mbps:8.2f} MB/s (into)")
-            return i, written
+    Container layout:
+      [MAGIC|VER|ALGO|CHUNK_SIZE|ORIG_SIZE] + N * ([orig_len|comp_len] + comp_bytes)
+    """
+    file_size = os.path.getsize(input_filename)
+    algo_id = _choose_algo(level)
+    algo_name = ALGO_NAMES[algo_id]
 
-        # Fallback: allocate an intermediate object
-        if algo == ALGO_ZSTD:
-            out = _get_zstd_dctx().decompress(view)
-        elif algo == ALGO_LZ4:
-            out = lz4.frame.decompress(view)
-        elif algo == ALGO_SNAPPY:
-            out = snappy.decompress(view)
-        elif algo == ALGO_BROTLI:
-            out = brotli.decompress(view)
-        else:
-            raise ValueError(f"Unknown algo id: {algo}")
+    if verbose:
+        print(f"Compressing {os.path.basename(input_filename)} → {os.path.basename(output_filename)} "
+              f"(level={level}) …")
+        if level.lower() in ("auto", "throughput", "fast", "speed"):
+            print(f"INFO: Auto-selected {algo_name}.")
 
-        t1 = time.perf_counter()
-        if self.verbose:
-            mbps = (len(out) / (1024 * 1024)) / max(1e-9, (t1 - t0))
-            print(f"[decomp ] chunk {i:5d}: {len(view)/1e6:8.2f}MB → {len(out)/1e6:8.2f}MB | {mbps:8.2f} MB/s")
-        return i, out
+    comp, _ = _codec_for(algo_id)
 
-    # compress
-    def compress_file(self, input_filename: str, output_filename: str, level: str):
-        with open(input_filename, "rb") as f_in, mmap.mmap(f_in.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            file_size = len(mm)
-            if file_size == 0:
-                with open(output_filename, "wb") as f_out:
-                    f_out.write(_pack_header_v2(ALGO_SNAPPY, 0, [], []))
-                return
+    # Open files
+    with open(input_filename, "rb") as f_in, open(output_filename, "wb") as f_out:
+        # Write file header
+        header = struct.pack(
+            HEADER_FMT, MAGIC, VERSION, algo_id, int(chunk_size), int(file_size)
+        )
+        f_out.write(header)
 
-            # policy
-            if level == "fastest":
-                algo, chunk_size, threads, zt = ALGO_SNAPPY, self.chunk_size, self.threads, 0
-            elif level == "max":
-                algo, chunk_size, threads, zt = ALGO_BROTLI, self.chunk_size, self.threads, 0
-            elif level == "throughput":
-                chunk_size, threads, zt, algo = _throughput_plan(file_size, os.cpu_count() or 4)
-                if self.verbose:
-                    print(f"INFO: Throughput plan → algo={ALGO_NAMES[algo]}, chunk={chunk_size//1024//1024}MiB, threads={threads}, zstd_threads={zt}")
-            else:
-                algo = _auto_choose_algorithm(mm[: min(file_size, 1024*1024)], self.zstd_level)
-                chunk_size, threads, zt = self.chunk_size, self.threads, self.zstd_threads
-                if self.verbose:
-                    print(f"INFO: Auto-selected {ALGO_NAMES[algo]}.")
-
-            # chunk views
+        # Memory-map the input (read-only)
+        mm = mmap.mmap(f_in.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            mv = memoryview(mm)
             try:
-                mm.madvise(mmap.MADV_SEQUENTIAL)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            chunk_views = list(_chunk_views(mm, chunk_size))
-            decomp_sizes = [len(v) for v in chunk_views]
-
-            hasher = _Hasher(self.checksum_algo)
-            comp_chunks: List[bytes] = [b""] * len(chunk_views)
-            tasks = [(i, v, algo, zt) for i, v in enumerate(chunk_views)]
-            if len(tasks) == 1 or threads == 1:
-                for t in tasks:
-                    i, out, view = self._compress_job(t)
-                    comp_chunks[i] = out
-                    if self.checksum_algo != HASH_NONE: hasher.update(view)
-            else:
-                with cf.ThreadPoolExecutor(max_workers=threads) as ex:
-                    for i, out, view in ex.map(self._compress_job, tasks, chunksize=1):
-                        comp_chunks[i] = out
-                        if self.checksum_algo != HASH_NONE: hasher.update(view)
-
-        comp_sizes = [len(c) for c in comp_chunks]
-        with open(output_filename, "wb") as f_out:
-            f_out.write(_pack_header_v2(algo, file_size, comp_sizes, decomp_sizes))
-            for c in comp_chunks:
-                f_out.write(c)
-            if self.checksum_algo != HASH_NONE:
-                f_out.write(_pack_footer(self.checksum_algo, hasher.digest()))
-
-    # decompress
-    def decompress_file(self, input_filename: str, output_filename: str):
-        with open(input_filename, "rb") as f_in, mmap.mmap(f_in.fileno(), 0, access=mmap.ACCESS_READ) as mm_in:
-            algo, orig_size, num_chunks, comp_sizes, decomp_sizes, data_start, ver = _unpack_header(f_in)
-            if orig_size == 0:
-                with open(output_filename, "wb"): pass
-                return
-
-            # I/O hints to kernel
-            try:
-                mm_in.madvise(mmap.MADV_SEQUENTIAL)  # type: ignore[attr-defined]
-                mm_in.madvise(mmap.MADV_WILLNEED)    # type: ignore[attr-defined]
-            except Exception:
-                pass
-
-            payload_len = sum(comp_sizes)
-            footer = _unpack_footer(mm_in, data_start + payload_len)
-
-            comp_views: List[memoryview] = []
-            off = data_start
-            for s in comp_sizes:
-                comp_views.append(memoryview(mm_in)[off:off+s]); off += s
-
-            with open(output_filename, "w+b") as f_out:
-                f_out.truncate(orig_size)
-                with mmap.mmap(f_out.fileno(), 0, access=mmap.ACCESS_WRITE) as mm_out:
+                pos = 0
+                chunk_idx = 0
+                while pos < len(mv):
+                    end = min(pos + chunk_size, len(mv))
+                    # Take a view onto this chunk
+                    chunk_view = mv[pos:end]
+                    t0 = time.perf_counter()
                     try:
-                        mm_out.madvise(mmap.MADV_SEQUENTIAL)  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
+                        # SAFETY: copy to bytes so no exported pointers persist
+                        data = bytes(chunk_view)
+                    finally:
+                        # Release the per-chunk view immediately
+                        chunk_view.release()
 
-                    if ver == 2 and decomp_sizes is not None:
-                        # prefix sums → per-chunk offsets
-                        offsets = [0] * num_chunks
-                        acc = 0
-                        for i, sz in enumerate(decomp_sizes):
-                            offsets[i] = acc; acc += sz
+                    # compress the bytes
+                    c_bytes = comp(data)
+                    t1 = time.perf_counter()
 
-                        def task(i_view):
-                            i, view = i_view
-                            start = offsets[i]
-                            end   = start + decomp_sizes[i]
-                            if algo == ALGO_ZSTD:
-                                # zero-copy into the output slice
-                                return self._decompress_job((i, view, algo, (start, end, mm_out)))
-                            else:
-                                # one allocation, then copy to the slice
-                                i2, out = self._decompress_job((i, view, algo, None))
-                                mv = memoryview(mm_out)[start:start+len(out)]
-                                mv[:] = out
-                                return i2, len(out)
+                    # write per-chunk header + data
+                    f_out.write(struct.pack(CHUNK_HDR_FMT, len(data), len(c_bytes)))
+                    f_out.write(c_bytes)
 
-                        if num_chunks == 1 or self.threads == 1:
-                            for i, view in enumerate(comp_views):
-                                task((i, view))
-                        else:
-                            with cf.ThreadPoolExecutor(max_workers=self.threads) as ex:
-                                for _ in ex.map(task, enumerate(comp_views), chunksize=1):
-                                    pass
-                    else:
-                        # v1: stream sequentially to output (constant RAM)
-                        write_off = 0
-                        for i, view in enumerate(comp_views):
-                            _, out = self._decompress_job((i, view, algo, None))
-                            end = write_off + len(out)
-                            mm_out[write_off:end] = out
-                            write_off = end
+                    if verbose:
+                        dt = max(t1 - t0, 1e-9)
+                        mb = len(data) / (1024 * 1024)
+                        thr = mb / dt
+                        print(f"[compress] chunk {chunk_idx:>4} : "
+                              f"{_fmt_bytes(len(data))} → {_fmt_bytes(len(c_bytes))}  |  {thr:,.2f} MB/s")
+                    chunk_idx += 1
+                    pos = end
+            finally:
+                # Release the top-level view before closing the mmap
+                mv.release()
+        finally:
+            mm.close()
 
-            # Optional integrity verification
-            if footer:
-                hash_algo_id, digest_expected = footer
-                hasher = _Hasher(hash_algo_id)
-                with open(output_filename, "rb") as f_chk:
-                    while True:
-                        buf = f_chk.read(8 * 1024 * 1024)
-                        if not buf: break
-                        hasher.update(buf)
-                calc = hasher.digest()
-                if calc != digest_expected:
-                    raise ValueError(f"Integrity check FAILED: expected {digest_expected.hex()}, got {calc.hex()}.")
 
-# ---- CLI builder (re-exported by warpcompress.cli) ----
-def _build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="WarpCompress: massive-file-ready lossless compression.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    sub = p.add_subparsers(dest="mode", required=True)
+def decompress_file(
+    input_filename: str,
+    output_filename: str,
+    *,
+    verbose: bool = False
+) -> None:
+    """
+    Decompress a .warp file created by `compress_file`.
+    """
+    with open(input_filename, "rb") as f_in:
+        # Read and validate header
+        hdr = f_in.read(HEADER_SIZE)
+        if len(hdr) != HEADER_SIZE:
+            raise ValueError("Input too small to be a valid .warp file")
 
-    def add_common(sp):
-        sp.add_argument("input_file")
-        sp.add_argument("output_file")
-        sp.add_argument("--threads", type=int, default=DEFAULT_THREADS)
-        sp.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
-        sp.add_argument("--zstd-level", type=int, default=DEFAULT_ZSTD_LEVEL)
-        sp.add_argument("--zstd-threads", type=int, default=DEFAULT_ZSTD_THREADS)
-        sp.add_argument("--brotli-quality", type=int, default=DEFAULT_BROTLI_QUALITY)
-        sp.add_argument("--verbose", action="store_true")
+        magic, ver, algo_id, chunk_size, orig_size = struct.unpack(HEADER_FMT, hdr)
+        if magic != MAGIC:
+            raise ValueError("Bad magic; not a warp file")
+        if ver != VERSION:
+            raise ValueError(f"Unsupported version: {ver}")
+        if algo_id not in ALGO_NAMES:
+            raise ValueError(f"Unknown algorithm id in file: {algo_id}")
 
-    sp_c = sub.add_parser("compress", help="Compress a file.")
-    add_common(sp_c)
-    sp_c.add_argument("--level", choices=["auto", "fastest", "max", "throughput"], default="auto")
-    sp_c.add_argument("--checksum", choices=["none", "blake3", "xxh64", "blake2b"], default="none")
+        algo_name = ALGO_NAMES[algo_id]
+        _, decomp = _codec_for(algo_id)
 
-    sp_d = sub.add_parser("decompress", help="Decompress a .warp file.")
-    add_common(sp_d)
-    return p
+        if verbose:
+            print(f"Decompressing with {algo_name} | chunk={_fmt_bytes(chunk_size)} | "
+                  f"orig={_fmt_bytes(orig_size)}")
+
+        remaining = orig_size
+        total_out = 0
+
+        with open(output_filename, "wb") as f_out:
+            idx = 0
+            while True:
+                ch = f_in.read(CHUNK_HDR_SIZE)
+                if not ch:
+                    break  # EOF
+                if len(ch) != CHUNK_HDR_SIZE:
+                    raise ValueError("Truncated chunk header")
+
+                orig_len, comp_len = struct.unpack(CHUNK_HDR_FMT, ch)
+                cbytes = f_in.read(comp_len)
+                if len(cbytes) != comp_len:
+                    raise ValueError("Truncated chunk data")
+
+                t0 = time.perf_counter()
+                data = decomp(cbytes)
+                t1 = time.perf_counter()
+
+                if len(data) != orig_len:
+                    raise ValueError("Decompressed length mismatch")
+
+                f_out.write(data)
+                total_out += len(data)
+                remaining = max(0, remaining - len(data))
+
+                if verbose:
+                    dt = max(t1 - t0, 1e-9)
+                    mb = len(data) / (1024 * 1024)
+                    thr = mb / dt
+                    print(f"[decompress] chunk {idx:>4} : "
+                          f"{_fmt_bytes(comp_len)} → {_fmt_bytes(len(data))}  |  {thr:,.2f} MB/s")
+                idx += 1
+
+        if total_out != orig_size:
+            raise ValueError(f"Size mismatch: expected {orig_size}, wrote {total_out}")
+
+# -----------------------------
+# Convenience (for CLI/tests)
+# -----------------------------
+
+def detect_algo_name(level: str) -> str:
+    """Small helper some UIs use for messaging."""
+    return ALGO_NAMES[_choose_algo(level)]
 
 
