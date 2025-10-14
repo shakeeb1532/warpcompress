@@ -1,34 +1,42 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=69", "wheel", "build"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "warpcompress"
-version = "1.0.1"
-description = "Massive-file-ready lossless compression with scatter-gather mmap decompression, throughput mode, and integrity footer."
+version = "0.1.0"
+description = "Massive-file-ready, parallel, lossless compressor with mmap scatter–gather I/O and adaptive throughput mode."
 readme = "README.md"
-license = {text = "MIT"}
-authors = [{name = "WarpCompress maintainers"}]
 requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Shakeeb Salman", email = "you@example.com" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: System :: Archiving :: Compression",
+  "Intended Audience :: Developers"
+]
+
 dependencies = [
-    "lz4>=4.3.3",
-    "zstandard>=0.22.0",
-    "python-snappy>=0.7.1",
-    "brotli>=1.0.9",
+  "zstandard>=0.22",
+  "lz4>=4.3",
+  "python-snappy>=0.7",
+  "brotli>=1.1"
 ]
 
 [project.optional-dependencies]
-hashes = [
-    "blake3>=0.4.1",
-    "xxhash>=3.4.1",
-]
+hashes = ["blake3>=0.4", "xxhash>=3.4"]
 
 [project.scripts]
-warp-compress = "warpcompress.cli:main"
+warp-compress = "warpcompress.cli:main"  # or :app if you use Typer
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.pytest.ini_options]
-addopts = "-q"
-python_files = "test_*.py"
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[project.urls]
+Homepage = "https://github.com/shakeeb1532/warpcompress"
+Issues = "https://github.com/shakeeb1532/warpcompress/issues"
