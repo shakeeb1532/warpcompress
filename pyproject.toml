@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "warpcompress"
-version = "0.1.0"
-description = "Massive-file-ready, parallel, lossless compressor with mmap scatter–gather I/O and adaptive throughput mode."
+version = "0.1.1"                  # <-- bumped
+description = "Fast, parallel, lossless compression with mmap scatter–gather I/O."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
@@ -26,10 +26,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-hashes = ["blake3>=0.4", "xxhash>=3.4"]
+hashes = ["blake3>=0.4", "xxhash>=3.4", "cramjam>=2.7"]  # optional extras
 
 [project.scripts]
-warp-compress = "warpcompress.cli:main"  # or :app if you use Typer
+warp-compress = "warpcompress.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -40,3 +40,4 @@ package-dir = {"" = "src"}
 [project.urls]
 Homepage = "https://github.com/shakeeb1532/warpcompress"
 Issues = "https://github.com/shakeeb1532/warpcompress/issues"
+
