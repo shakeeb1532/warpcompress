@@ -1,12 +1,12 @@
 
 # Copyright 2025
-# WarpCompress core — parallel (de)compression with safe mmap usage
+# WarpCompress core — parallel (de)compression, faster compression path
 from __future__ import annotations
 import os
-import io
 import time
 import mmap
 import struct
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Tuple, List, Optional, Dict
 
@@ -51,47 +51,76 @@ def _fmt_bytes(n: int) -> str:
         x /= 1024.0
     return f"{x:.2f} PB"
 
-def _cpu_workers(default: int = 0) -> int:
-    if default > 0:
+def _cpu_workers(default: Optional[int] = None) -> int:
+    # default may be None; choose a sensible number
+    if isinstance(default, int) and default > 0:
         return default
     cpus = os.cpu_count() or 4
-    return max(2, min(32, cpus))  # sensible ceiling
+    return max(2, min(32, cpus))
 
-def _plan_for(level: Optional[str], chunk_size: Optional[int], workers: Optional[int]):
+def _plan_for(level: Optional[str],
+              chunk_size: Optional[int],
+              workers: Optional[int]) -> Tuple[int, int, int, int, int]:
     """
     Returns: (algo_id, chunk, workers, zstd_level, zstd_threads)
+
     Tuned levels:
-      - throughput/auto/snappy  -> snappy, 8 MiB, workers=cpu
-      - lz4                     -> lz4,    8 MiB, workers=cpu
-      - zstd / balanced / default -> zstd (level 3), 8 MiB
-      - ratio / brotli          -> brotli (q=5), 8 MiB
+      - throughput/auto/snappy  -> snappy, chunk=8 MiB, workers=cpu
+      - lz4                     -> lz4,    chunk=8 MiB, workers=cpu
+      - zstd/balanced/default   -> zstd,   chunk=8 MiB, level=3
+      - ratio/brotli/max        -> brotli, chunk=8 MiB
     """
     lvl = (level or "throughput").lower()
-    if lvl in ("throughput", "auto", "snappy", "speed", "fast"):
-        return (ALGO_SNAPPY, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 0, 0)
-    if lvl in ("lz4",):
-        return (ALGO_LZ4, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 0, 0)
-    if lvl in ("zstd", "balanced", "default"):
-        return (ALGO_ZSTD, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 3, 0)
-    if lvl in ("ratio", "brotli", "max"):
-        return (ALGO_BROTLI, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 0, 0)
-    # Fallback to throughput
-    return (ALGO_SNAPPY, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 0, 0)
+    w = _cpu_workers(workers)
+    c = int(chunk_size or CHUNK_SIZE_DEFAULT)
 
-def _codec_for(algo_id: int, *, zstd_level: int = 3, zstd_threads: int = 0
-               ) -> Tuple[Callable[[bytes], bytes], Callable[[bytes], bytes]]:
-    """Return (compress, decompress) callables. Objects are reused where it helps."""
+    if lvl in ("throughput", "auto", "snappy", "speed", "fast"):
+        return (ALGO_SNAPPY, c, w, 0, 0)
+    if lvl in ("lz4",):
+        return (ALGO_LZ4, c, w, 0, 0)
+    if lvl in ("zstd", "balanced", "default"):
+        # When using our own thread pool (w>1), keep Zstd internal threads=0 to avoid oversubscription.
+        # If single-threaded, give Zstd its own threads (per library guidance).
+        zstd_threads = 0 if w > 1 else max(1, _cpu_workers(0))
+        return (ALGO_ZSTD, c, w, 3, zstd_threads)
+    if lvl in ("ratio", "brotli", "max"):
+        return (ALGO_BROTLI, c, w, 0, 0)
+    # Fallback to throughput
+    return (ALGO_SNAPPY, c, w, 0, 0)
+
+# ---- per-thread codec providers (avoid shared-state contention) ----
+_tls = threading.local()
+
+def _thread_comp_fn(algo_id: int, zstd_level: int, zstd_threads: int) -> Callable[[bytes], bytes]:
     if algo_id == ALGO_SNAPPY:
-        return snappy.compress, snappy.uncompress
+        return snappy.compress
     if algo_id == ALGO_LZ4:
-        return (lambda b: lz4f.compress(b)), (lambda b: lz4f.decompress(b))
+        return lz4f.compress
     if algo_id == ALGO_ZSTD:
-        # One compressor/decompressor reused from the outer scope
-        zc = zstd.ZstdCompressor(level=zstd_level, threads=zstd_threads or 0)
-        zd = zstd.ZstdDecompressor()
-        return zc.compress, zd.decompress
+        key = (zstd_level, zstd_threads)
+        zc = getattr(_tls, "zc", None)
+        zck = getattr(_tls, "zck", None)
+        if zc is None or zck != key:
+            _tls.zc = zstd.ZstdCompressor(level=zstd_level, threads=zstd_threads or 0)
+            _tls.zck = key
+        return _tls.zc.compress
     if algo_id == ALGO_BROTLI:
-        return (lambda b: brotli.compress(b, quality=5)), brotli.decompress
+        # quality 5 is a good speed/ratio balance; adjust if you expose a flag
+        return lambda b: brotli.compress(b, quality=5)
+    raise ValueError(f"Unknown algorithm id: {algo_id}")
+
+def _thread_decomp_fn(algo_id: int) -> Callable[[bytes], bytes]:
+    if algo_id == ALGO_SNAPPY:
+        return snappy.uncompress
+    if algo_id == ALGO_LZ4:
+        return lz4f.decompress
+    if algo_id == ALGO_ZSTD:
+        zd = getattr(_tls, "zd", None)
+        if zd is None:
+            _tls.zd = zstd.ZstdDecompressor()
+        return _tls.zd.decompress
+    if algo_id == ALGO_BROTLI:
+        return brotli.decompress
     raise ValueError(f"Unknown algorithm id: {algo_id}")
 
 # ========= Parallel COMPRESSION =========
@@ -105,13 +134,12 @@ def compress_file(
     verbose: bool = False,
 ) -> None:
     """
-    Threaded compression: read input mmapped, submit chunk compress tasks, and
-    write records in-order. Uses bytes() copies to avoid exported-pointer issues.
+    Threaded compression: mmapped input, per-chunk jobs in a pool, in-order write-out.
+    We copy the mmap slice to bytes() to avoid exported-pointer issues on Py3.12/3.13.
     """
     file_size = os.path.getsize(input_filename)
     algo_id, csize, worker_count, zstd_level, zstd_threads = _plan_for(level, chunk_size, workers)
     algo_name = ALGO_NAMES[algo_id]
-    comp, _ = _codec_for(algo_id, zstd_level=zstd_level, zstd_threads=zstd_threads)
 
     if verbose:
         print(f"Compressing {os.path.basename(input_filename)} → {os.path.basename(output_filename)} (level={level}) …")
@@ -119,7 +147,7 @@ def compress_file(
 
     # Memory-map input
     with open(input_filename, "rb") as f_in, open(output_filename, "wb") as f_out:
-        # Write file header
+        # Write header
         f_out.write(struct.pack(HEADER_FMT, MAGIC, VERSION, algo_id, csize, file_size))
 
         mm = mmap.mmap(f_in.fileno(), 0, access=mmap.ACCESS_READ)
@@ -130,28 +158,30 @@ def compress_file(
                 n_chunks = (mv_len + csize - 1) // csize
 
                 def job(idx: int) -> Tuple[int, int, bytes, float]:
+                    # slice → copy to bytes → compress with a per-thread codec
                     start = idx * csize
                     end = min(start + csize, mv_len)
-                    # copy slice to bytes to break ties with mmap
                     t0 = time.perf_counter()
                     view = mv[start:end]
                     try:
-                        data = bytes(view)
+                        data = bytes(view)  # break exported-pointer tie
                     finally:
                         view.release()
+
+                    comp = _thread_comp_fn(algo_id, zstd_level, zstd_threads)
                     cbytes = comp(data)
                     t1 = time.perf_counter()
                     return idx, len(data), cbytes, (t1 - t0)
 
-                # Bounded in-flight to control memory usage
+                # Bounded in-flight to keep the pipeline full without blowing memory
                 next_to_write = 0
                 pending: Dict[int, Tuple[int, bytes, float]] = {}
                 submitted = 0
+                max_inflight = max(worker_count * 4, 8)  # more aggressive than before
 
                 with ThreadPoolExecutor(max_workers=worker_count) as ex:
                     futures = []
                     # Prime the queue
-                    max_inflight = worker_count * 2
                     while submitted < n_chunks and len(futures) < max_inflight:
                         futures.append(ex.submit(job, submitted)); submitted += 1
 
@@ -160,11 +190,12 @@ def compress_file(
                             idx, orig_len, cbytes, dt = fut.result()
                             pending[idx] = (orig_len, cbytes, dt)
                             futures.remove(fut)
-                            # Keep submitting while we have capacity
+
+                            # Keep submitting new work
                             if submitted < n_chunks:
                                 futures.append(ex.submit(job, submitted)); submitted += 1
 
-                            # Write any ready-in-order chunks
+                            # Write any contiguous ready chunks
                             while next_to_write in pending:
                                 o_len, c_b, c_dt = pending.pop(next_to_write)
                                 f_out.write(struct.pack(CHUNK_HDR_FMT, o_len, len(c_b)))
@@ -174,7 +205,6 @@ def compress_file(
                                     thr = mb / max(c_dt, 1e-9)
                                     print(f"[compress] chunk {next_to_write:>4}: {_fmt_bytes(o_len)} → {_fmt_bytes(len(c_b))} | {thr:,.2f} MB/s")
                                 next_to_write += 1
-                        # loop continues until all futures resolved & written
             finally:
                 mv.release()
         finally:
@@ -206,9 +236,9 @@ def decompress_file(
         if algo_id not in ALGO_NAMES:  raise ValueError(f"Unknown algorithm id: {algo_id}")
 
         algo_name = ALGO_NAMES[algo_id]
-        _, decomp = _codec_for(algo_id)
+        decomp = _thread_decomp_fn(algo_id)
 
-        # --- scan chunk records to build index ---
+        # --- build index ---
         chunk_index: List[Tuple[int, int, int, int]] = []  # (file_off, comp_len, out_off, orig_len)
         out_off = 0
         file_off = HEADER_SIZE
@@ -225,18 +255,17 @@ def decompress_file(
             file_off = data_off + comp_len
             out_off += orig_len
 
-        # --- prepare output file (pre-allocate & mmap) ---
+        # --- prepare output file ---
         with open(output_filename, "wb") as f_out:
             f_out.truncate(orig_size)
 
         if verbose:
             print(f"Decompressing with {algo_name} | chunk={_fmt_bytes(csize)} | orig={_fmt_bytes(orig_size)} | chunks={len(chunk_index)}")
 
-        # mmap source once for fast slicing
+        # mmap input & output
         with open(input_filename, "rb") as fin2:
             mm_in = mmap.mmap(fin2.fileno(), 0, access=mmap.ACCESS_READ)
             try:
-                # mmap destination for random writes
                 with open(output_filename, "r+b") as fout2:
                     mm_out = mmap.mmap(fout2.fileno(), 0, access=mmap.ACCESS_WRITE)
                     try:
@@ -244,9 +273,7 @@ def decompress_file(
 
                         def job(rec):
                             data_off, comp_len, out_off, orig_len = rec
-                            # copy compressed bytes (avoid exported-pointer ties)
-                            cview = mm_in[data_off:data_off+comp_len]
-                            cbytes = bytes(cview)  # copy
+                            cbytes = bytes(mm_in[data_off:data_off+comp_len])
                             t0 = time.perf_counter()
                             data = decomp(cbytes)
                             t1 = time.perf_counter()
@@ -254,35 +281,29 @@ def decompress_file(
                                 raise ValueError("Decompressed length mismatch")
                             return out_off, data, (t1 - t0), orig_len
 
-                        # Submit all jobs (bound inflight for memory)
-                        max_inflight = _cpu_workers(workers) * 2
+                        max_inflight = max(worker_count * 4, 8)
                         next_idx = 0
                         in_flight: List = []
                         total_written = 0
 
                         with ThreadPoolExecutor(max_workers=worker_count) as ex:
-                            # prime
                             while next_idx < len(chunk_index) and len(in_flight) < max_inflight:
-                                in_flight.append(ex.submit(job, chunk_index[next_idx]))
-                                next_idx += 1
+                                in_flight.append(ex.submit(job, chunk_index[next_idx])); next_idx += 1
 
                             while in_flight:
                                 for fut in as_completed(in_flight):
                                     out_off, data, dt, o_len = fut.result()
-                                    # unordered write is fine; we write to the correct offset
                                     mm_out[out_off:out_off+len(data)] = data
                                     if verbose:
                                         mb = o_len / (1024*1024)
                                         thr = mb / max(dt, 1e-9)
-                                        # compute chunk ordinal (best-effort)
                                         print(f"[decompress] chunk @+{out_off}: {_fmt_bytes(o_len)} | {thr:,.2f} MB/s")
                                     total_written += len(data)
                                     in_flight.remove(fut)
 
-                                    # keep pipeline full
                                     if next_idx < len(chunk_index):
-                                        in_flight.append(ex.submit(job, chunk_index[next_idx]))
-                                        next_idx += 1
+                                        in_flight.append(ex.submit(job, chunk_index[next_idx])); next_idx += 1
+
                         if total_written != orig_size:
                             raise ValueError(f"Size mismatch: expected {orig_size}, wrote {total_written}")
                     finally:
