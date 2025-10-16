@@ -1,6 +1,7 @@
 """
 WarpCompress package
 """
-__all__ = ["compress_file", "decompress_file"]
-__version__ = "0.1.3"  
+__all__ = ["__version__"]
+__version__ = "0.7.0"
+
 
