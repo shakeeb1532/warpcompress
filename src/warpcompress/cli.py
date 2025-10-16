@@ -1,7 +1,10 @@
 # WarpCompress CLI
 import argparse
 import sys
-from .core import compress_file, decompress_file, detect_algo_name, CHUNK_SIZE_DEFAULT, _fmt_bytes
+from .core import (
+    compress_file, decompress_file, detect_algo_name,
+    CHUNK_SIZE_DEFAULT, _fmt_bytes
+)
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -26,6 +29,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pd.add_argument("output_file")
     pd.add_argument("--workers", type=int, default=None,
                     help="Worker threads (default: CPU count)")
+    pd.add_argument("--decomp-mode", default="auto", choices=["auto","seq","par"],
+                    help="Decompression mode: auto (default), seq=parallel decode + sequential writes, par=parallel mmap writes")
     pd.add_argument("--verbose", action="store_true")
     return p
 
@@ -48,6 +53,7 @@ def main() -> int:
                 args.input_file,
                 args.output_file,
                 workers=args.workers,
+                decomp_mode=args.decomp_mode,
                 verbose=args.verbose,
             )
         else:
@@ -61,5 +67,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
 
