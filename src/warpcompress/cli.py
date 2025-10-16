@@ -18,14 +18,14 @@ def _build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--chunk-size", type=int, default=None,
                     help=f"Chunk size in bytes (default: {_fmt_bytes(CHUNK_SIZE_DEFAULT)})")
     pc.add_argument("--workers", type=int, default=None,
-                    help="Number of worker threads (default: CPU count)")
+                    help="Worker threads (default: CPU count)")
     pc.add_argument("--verbose", action="store_true")
 
     pd = sub.add_parser("decompress", help="Decompress a .warp file")
     pd.add_argument("input_file")
     pd.add_argument("output_file")
     pd.add_argument("--workers", type=int, default=None,
-                    help="Number of worker threads (default: CPU count)")
+                    help="Worker threads (default: CPU count)")
     pd.add_argument("--verbose", action="store_true")
     return p
 
@@ -61,4 +61,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
