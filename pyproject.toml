@@ -1,43 +1,27 @@
-[build-system]
-requires = ["setuptools>=69", "wheel", "build"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "warpcompress"
-version = "0.1.5"                  # <-- bumped
-description = "Fast, parallel, lossless compression with mmap scatter–gather I/O."
+version = "0.7.0"
+description = "WarpCompress: adaptive, parallel (de)compression in pure Python with RAW/ZERO/LZ4/Snappy/Zstd per chunk, hybrid Zstd, and batched I/O."
 readme = "README.md"
-requires-python = ">=3.9"
-license = { file = "LICENSE" }
-authors = [{ name = "Shakeeb Salman", email = "you@example.com" }]
-classifiers = [
-  "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
-  "Topic :: System :: Archiving :: Compression",
-  "Intended Audience :: Developers"
-]
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Shakeeb", email = "you@example.com" }]
 
 dependencies = [
-  "zstandard>=0.22",
-  "lz4>=4.3",
-  "python-snappy>=0.7",
-  "brotli>=1.1"
+  "python-snappy>=0.7.1",
+  "lz4>=4.3.2",
+  "zstandard>=0.22.0",
+  "brotli>=1.1.0",
 ]
 
 [project.optional-dependencies]
-hashes = ["blake3>=0.4", "xxhash>=3.4", "cramjam>=2.7"]  # optional extras
+hashes = ["xxhash>=3.0.0"]
 
 [project.scripts]
 warp-compress = "warpcompress.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-
-[project.urls]
-Homepage = "https://github.com/shakeeb1532/warpcompress"
-Issues = "https://github.com/shakeeb1532/warpcompress/issues"
 
