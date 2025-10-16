@@ -1,25 +1,32 @@
-# cli.py — WarpCompress CLI
+# WarpCompress CLI
 import argparse
 import sys
-from .core import compress_file, decompress_file, detect_algo_name
+from .core import compress_file, decompress_file, detect_algo_name, CHUNK_SIZE_DEFAULT, _fmt_bytes
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="warp-compress", description="WarpCompress: massive-file-ready lossless compression.")
+    p = argparse.ArgumentParser(
+        prog="warp-compress",
+        description="WarpCompress: fast, chunked compression with parallel (de)compression."
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pc = sub.add_parser("compress", help="Compress a file.")
+    pc = sub.add_parser("compress", help="Compress a file")
     pc.add_argument("input_file")
     pc.add_argument("output_file")
-    pc.add_argument("--level", default="auto",
-                    help="snappy|lz4|zstd|brotli or modes: auto/throughput/balanced/ratio (default: auto)")
-    pc.add_argument("--chunk-size", type=int, default=None, help="Chunk size in bytes (default: 4MiB).")
+    pc.add_argument("--level", default="throughput",
+                    help="throughput(snappy) | lz4 | zstd | ratio(brotli)")
+    pc.add_argument("--chunk-size", type=int, default=None,
+                    help=f"Chunk size in bytes (default: {_fmt_bytes(CHUNK_SIZE_DEFAULT)})")
+    pc.add_argument("--workers", type=int, default=None,
+                    help="Number of worker threads (default: CPU count)")
     pc.add_argument("--verbose", action="store_true")
 
-    pd = sub.add_parser("decompress", help="Decompress a .warp file.")
+    pd = sub.add_parser("decompress", help="Decompress a .warp file")
     pd.add_argument("input_file")
     pd.add_argument("output_file")
+    pd.add_argument("--workers", type=int, default=None,
+                    help="Number of worker threads (default: CPU count)")
     pd.add_argument("--verbose", action="store_true")
-
     return p
 
 def main() -> int:
@@ -32,13 +39,19 @@ def main() -> int:
                 args.input_file,
                 args.output_file,
                 level=args.level,
-                chunk_size=args.chunk_size if args.chunk_size else None or 4 * 1024 * 1024,
+                chunk_size=args.chunk_size,
+                workers=args.workers,
                 verbose=args.verbose,
             )
         elif args.cmd == "decompress":
-            decompress_file(args.input_file, args.output_file, verbose=args.verbose)
+            decompress_file(
+                args.input_file,
+                args.output_file,
+                workers=args.workers,
+                verbose=args.verbose,
+            )
         else:
-            raise SystemExit(2)
+            return 2
         return 0
     except KeyboardInterrupt:
         return 130
@@ -48,5 +61,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
 
