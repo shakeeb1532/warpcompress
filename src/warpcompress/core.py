@@ -1,5 +1,5 @@
 # Copyright 2025
-# WarpCompress core — v0.2.0 ultra throughput, batched I/O, hybrid zstd, coalescing, NumPy fast paths (pure Python)
+# WarpCompress core — v0.7.0 ultra throughput, batched I/O, hybrid zstd, coalescing, NumPy fast paths (pure Python)
 from __future__ import annotations
 import os, time, mmap, struct, threading, ctypes
 from typing import Tuple, List, Optional, Dict, Set
