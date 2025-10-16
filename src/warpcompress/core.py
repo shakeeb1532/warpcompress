@@ -1,14 +1,14 @@
 
 # Copyright 2025
-# src/warpcompress/core.py
-# WarpCompress core — mmap + safe memoryview release (Py 3.12/3.13 compatible)
-
+# WarpCompress core — parallel (de)compression with safe mmap usage
 from __future__ import annotations
 import os
+import io
 import time
 import mmap
 import struct
-from typing import Callable, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Tuple, List, Optional, Dict
 
 # External codecs
 import snappy
@@ -16,27 +16,19 @@ import lz4.frame as lz4f
 import zstandard as zstd
 import brotli
 
-# =========================
-# Container / wire constants
-# =========================
-
-MAGIC = b"WARP"                 # 4 bytes
-VERSION = 1                     # 1 byte
-# MAGIC(4s) | VER(B) | ALGO(B) | CHUNK_SIZE(I) | ORIG_SIZE(Q)
-HEADER_FMT = ">4sB B I Q"
+# ===== Container format =====
+MAGIC = b"WARP"                  # 4 bytes
+VERSION = 1                      # 1 byte
+HEADER_FMT = ">4sB B I Q"        # MAGIC, VER, ALGO_ID, CHUNK_SIZE, ORIG_SIZE
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
-# Per-chunk header: ORIG_LEN(uint32), COMP_LEN(uint32)
-CHUNK_HDR_FMT = ">II"
+CHUNK_HDR_FMT = ">II"            # ORIG_LEN (uint32), COMP_LEN (uint32)
 CHUNK_HDR_SIZE = struct.calcsize(CHUNK_HDR_FMT)
 
-# Default chunk
-CHUNK_SIZE_DEFAULT = 2 * 1024 * 1024  # 2 MiB (matches your throughput log)
+# Bigger default chunk for better throughput
+CHUNK_SIZE_DEFAULT = 8 * 1024 * 1024  # 8 MiB
 
-# =================
-# Algorithms mapping
-# =================
-
+# ===== Algorithms =====
 ALGO_SNAPPY = 1
 ALGO_LZ4    = 2
 ALGO_ZSTD   = 3
@@ -50,10 +42,7 @@ ALGO_NAMES = {
 }
 NAME_TO_ID = {v: k for k, v in ALGO_NAMES.items()}
 
-# =========
-# Utilities
-# =========
-
+# ===== Helpers =====
 def _fmt_bytes(n: int) -> str:
     x = float(n)
     for u in ("B", "KB", "MB", "GB", "TB"):
@@ -62,188 +51,248 @@ def _fmt_bytes(n: int) -> str:
         x /= 1024.0
     return f"{x:.2f} PB"
 
-def _choose_plan(level: Optional[str]) -> tuple[int, int, int, int]:
-    """
-    Return (algo_id, chunk_size, threads, zstd_threads) for a given 'level'.
-    - 'throughput'/'auto' → snappy, 2MiB, threads=4
-    - 'lz4'               → lz4,    2MiB
-    - 'balanced'/'zstd'   → zstd,   2MiB
-    - 'ratio'/'brotli'    → brotli, 2MiB
-    """
-    lvl = (level or "auto").lower()
-    if lvl in ("throughput", "auto", "speed", "fast", "snappy"):
-        return (ALGO_SNAPPY, CHUNK_SIZE_DEFAULT, 4, 0)
-    if lvl in ("lz4",):
-        return (ALGO_LZ4, CHUNK_SIZE_DEFAULT, 0, 0)
-    if lvl in ("balanced", "default", "zstd"):
-        return (ALGO_ZSTD, CHUNK_SIZE_DEFAULT, 0, 0)  # set zstd_threads>0 if you want MT
-    if lvl in ("ratio", "max", "brotli"):
-        return (ALGO_BROTLI, CHUNK_SIZE_DEFAULT, 0, 0)
-    # Fallback to throughput plan
-    return (ALGO_SNAPPY, CHUNK_SIZE_DEFAULT, 4, 0)
+def _cpu_workers(default: int = 0) -> int:
+    if default > 0:
+        return default
+    cpus = os.cpu_count() or 4
+    return max(2, min(32, cpus))  # sensible ceiling
 
-# =======
-# Codecs
-# =======
+def _plan_for(level: Optional[str], chunk_size: Optional[int], workers: Optional[int]):
+    """
+    Returns: (algo_id, chunk, workers, zstd_level, zstd_threads)
+    Tuned levels:
+      - throughput/auto/snappy  -> snappy, 8 MiB, workers=cpu
+      - lz4                     -> lz4,    8 MiB, workers=cpu
+      - zstd / balanced / default -> zstd (level 3), 8 MiB
+      - ratio / brotli          -> brotli (q=5), 8 MiB
+    """
+    lvl = (level or "throughput").lower()
+    if lvl in ("throughput", "auto", "snappy", "speed", "fast"):
+        return (ALGO_SNAPPY, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 0, 0)
+    if lvl in ("lz4",):
+        return (ALGO_LZ4, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 0, 0)
+    if lvl in ("zstd", "balanced", "default"):
+        return (ALGO_ZSTD, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 3, 0)
+    if lvl in ("ratio", "brotli", "max"):
+        return (ALGO_BROTLI, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 0, 0)
+    # Fallback to throughput
+    return (ALGO_SNAPPY, int(chunk_size or CHUNK_SIZE_DEFAULT), _cpu_workers(workers), 0, 0)
 
 def _codec_for(algo_id: int, *, zstd_level: int = 3, zstd_threads: int = 0
                ) -> Tuple[Callable[[bytes], bytes], Callable[[bytes], bytes]]:
+    """Return (compress, decompress) callables. Objects are reused where it helps."""
     if algo_id == ALGO_SNAPPY:
         return snappy.compress, snappy.uncompress
     if algo_id == ALGO_LZ4:
         return (lambda b: lz4f.compress(b)), (lambda b: lz4f.decompress(b))
     if algo_id == ALGO_ZSTD:
-        if zstd_threads and zstd_threads > 0:
-            zc = zstd.ZstdCompressor(level=zstd_level, threads=zstd_threads)
-        else:
-            zc = zstd.ZstdCompressor(level=zstd_level)
+        # One compressor/decompressor reused from the outer scope
+        zc = zstd.ZstdCompressor(level=zstd_level, threads=zstd_threads or 0)
         zd = zstd.ZstdDecompressor()
         return zc.compress, zd.decompress
     if algo_id == ALGO_BROTLI:
         return (lambda b: brotli.compress(b, quality=5)), brotli.decompress
     raise ValueError(f"Unknown algorithm id: {algo_id}")
 
-# ===========
-# Public API
-# ===========
-
+# ========= Parallel COMPRESSION =========
 def compress_file(
     input_filename: str,
     output_filename: str,
-    level: str = "auto",
+    level: str = "throughput",
     *,
     chunk_size: Optional[int] = None,
+    workers: Optional[int] = None,
     verbose: bool = False,
 ) -> None:
     """
-    Compress `input_filename` into a .warp container at `output_filename`.
-    Uses mmap + memoryviews but **always** releases views before closing mmap
-    to avoid BufferError: "cannot close exported pointers exist".
+    Threaded compression: read input mmapped, submit chunk compress tasks, and
+    write records in-order. Uses bytes() copies to avoid exported-pointer issues.
     """
     file_size = os.path.getsize(input_filename)
-
-    algo_id, plan_chunk, threads, zstd_threads = _choose_plan(level)
-    csize = int(chunk_size or plan_chunk)
+    algo_id, csize, worker_count, zstd_level, zstd_threads = _plan_for(level, chunk_size, workers)
     algo_name = ALGO_NAMES[algo_id]
+    comp, _ = _codec_for(algo_id, zstd_level=zstd_level, zstd_threads=zstd_threads)
 
     if verbose:
-        # Match your previous log style
         print(f"Compressing {os.path.basename(input_filename)} → {os.path.basename(output_filename)} (level={level}) …")
-        print(f"INFO: Throughput plan → algo={algo_name}, chunk={_fmt_bytes(csize)}, threads={threads}, zstd_threads={zstd_threads}")
+        print(f"INFO: plan → algo={algo_name}, chunk={_fmt_bytes(csize)}, workers={worker_count}, zstd_threads={zstd_threads}")
 
-    comp, _ = _codec_for(algo_id, zstd_level=3, zstd_threads=zstd_threads)
-
+    # Memory-map input
     with open(input_filename, "rb") as f_in, open(output_filename, "wb") as f_out:
-        # Write container header
+        # Write file header
         f_out.write(struct.pack(HEADER_FMT, MAGIC, VERSION, algo_id, csize, file_size))
 
-        # IMPORTANT: manage mmap manually (no `with mmap(...) as mm:`)
         mm = mmap.mmap(f_in.fileno(), 0, access=mmap.ACCESS_READ)
         try:
             mv = memoryview(mm)
             try:
-                pos = 0
-                idx = 0
                 mv_len = len(mv)
-                while pos < mv_len:
-                    end = min(pos + csize, mv_len)
+                n_chunks = (mv_len + csize - 1) // csize
 
-                    # Take a slice view → copy to bytes → RELEASE view immediately
+                def job(idx: int) -> Tuple[int, int, bytes, float]:
+                    start = idx * csize
+                    end = min(start + csize, mv_len)
+                    # copy slice to bytes to break ties with mmap
                     t0 = time.perf_counter()
-                    chunk_view = mv[pos:end]
+                    view = mv[start:end]
                     try:
-                        data = bytes(chunk_view)  # breaks exported-pointer tie with mm
+                        data = bytes(view)
                     finally:
-                        chunk_view.release()      # critical for Py 3.12/3.13
-
+                        view.release()
                     cbytes = comp(data)
                     t1 = time.perf_counter()
+                    return idx, len(data), cbytes, (t1 - t0)
 
-                    # Write per-chunk header + payload
-                    f_out.write(struct.pack(CHUNK_HDR_FMT, len(data), len(cbytes)))
-                    f_out.write(cbytes)
+                # Bounded in-flight to control memory usage
+                next_to_write = 0
+                pending: Dict[int, Tuple[int, bytes, float]] = {}
+                submitted = 0
 
-                    if verbose:
-                        dt = max(t1 - t0, 1e-9)
-                        mb = len(data) / (1024 * 1024)
-                        print(f"[compress] chunk {idx:>4}: {_fmt_bytes(len(data))} → {_fmt_bytes(len(cbytes))} | {mb/dt:,.2f} MB/s")
-                    idx += 1
-                    pos = end
+                with ThreadPoolExecutor(max_workers=worker_count) as ex:
+                    futures = []
+                    # Prime the queue
+                    max_inflight = worker_count * 2
+                    while submitted < n_chunks and len(futures) < max_inflight:
+                        futures.append(ex.submit(job, submitted)); submitted += 1
+
+                    while futures:
+                        for fut in as_completed(futures):
+                            idx, orig_len, cbytes, dt = fut.result()
+                            pending[idx] = (orig_len, cbytes, dt)
+                            futures.remove(fut)
+                            # Keep submitting while we have capacity
+                            if submitted < n_chunks:
+                                futures.append(ex.submit(job, submitted)); submitted += 1
+
+                            # Write any ready-in-order chunks
+                            while next_to_write in pending:
+                                o_len, c_b, c_dt = pending.pop(next_to_write)
+                                f_out.write(struct.pack(CHUNK_HDR_FMT, o_len, len(c_b)))
+                                f_out.write(c_b)
+                                if verbose:
+                                    mb = o_len / (1024 * 1024)
+                                    thr = mb / max(c_dt, 1e-9)
+                                    print(f"[compress] chunk {next_to_write:>4}: {_fmt_bytes(o_len)} → {_fmt_bytes(len(c_b))} | {thr:,.2f} MB/s")
+                                next_to_write += 1
+                        # loop continues until all futures resolved & written
             finally:
-                # Release top-level view before closing the mmap
                 mv.release()
         finally:
             mm.close()
 
-
+# ========= Parallel DECOMPRESSION =========
 def decompress_file(
     input_filename: str,
     output_filename: str,
     *,
+    workers: Optional[int] = None,
     verbose: bool = False,
 ) -> None:
     """
-    Decompress a .warp file created by `compress_file`.
-    Uses simple streaming I/O (no mmap needed).
+    Threaded decompression:
+      1) read header, scan chunk table to build (in_off, comp_len, out_off, orig_len)
+      2) pre-allocate output and mmap
+      3) thread-pool to decode chunks and write to output offsets
     """
     with open(input_filename, "rb") as f_in:
+        # --- header ---
         hdr = f_in.read(HEADER_SIZE)
         if len(hdr) != HEADER_SIZE:
             raise ValueError("Input too small to be a valid .warp file")
 
         magic, ver, algo_id, csize, orig_size = struct.unpack(HEADER_FMT, hdr)
-        if magic != MAGIC:
-            raise ValueError("Bad magic; not a warp file")
-        if ver != VERSION:
-            raise ValueError(f"Unsupported version: {ver}")
-        if algo_id not in ALGO_NAMES:
-            raise ValueError(f"Unknown algorithm id in file: {algo_id}")
+        if magic != MAGIC:  raise ValueError("Bad magic; not a warp file")
+        if ver != VERSION:  raise ValueError(f"Unsupported version: {ver}")
+        if algo_id not in ALGO_NAMES:  raise ValueError(f"Unknown algorithm id: {algo_id}")
 
         algo_name = ALGO_NAMES[algo_id]
         _, decomp = _codec_for(algo_id)
 
-        if verbose:
-            print(f"Decompressing with {algo_name} | chunk={_fmt_bytes(csize)} | orig={_fmt_bytes(orig_size)}")
+        # --- scan chunk records to build index ---
+        chunk_index: List[Tuple[int, int, int, int]] = []  # (file_off, comp_len, out_off, orig_len)
+        out_off = 0
+        file_off = HEADER_SIZE
+        while True:
+            f_in.seek(file_off)
+            ch = f_in.read(CHUNK_HDR_SIZE)
+            if not ch:
+                break
+            if len(ch) != CHUNK_HDR_SIZE:
+                raise ValueError("Truncated chunk header")
+            orig_len, comp_len = struct.unpack(CHUNK_HDR_FMT, ch)
+            data_off = file_off + CHUNK_HDR_SIZE
+            chunk_index.append((data_off, comp_len, out_off, orig_len))
+            file_off = data_off + comp_len
+            out_off += orig_len
 
-        total_out = 0
+        # --- prepare output file (pre-allocate & mmap) ---
         with open(output_filename, "wb") as f_out:
-            idx = 0
-            while True:
-                ch = f_in.read(CHUNK_HDR_SIZE)
-                if not ch:
-                    break  # EOF
-                if len(ch) != CHUNK_HDR_SIZE:
-                    raise ValueError("Truncated chunk header")
+            f_out.truncate(orig_size)
 
-                orig_len, comp_len = struct.unpack(CHUNK_HDR_FMT, ch)
-                cbytes = f_in.read(comp_len)
-                if len(cbytes) != comp_len:
-                    raise ValueError("Truncated chunk data")
+        if verbose:
+            print(f"Decompressing with {algo_name} | chunk={_fmt_bytes(csize)} | orig={_fmt_bytes(orig_size)} | chunks={len(chunk_index)}")
 
-                t0 = time.perf_counter()
-                data = decomp(cbytes)
-                t1 = time.perf_counter()
+        # mmap source once for fast slicing
+        with open(input_filename, "rb") as fin2:
+            mm_in = mmap.mmap(fin2.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                # mmap destination for random writes
+                with open(output_filename, "r+b") as fout2:
+                    mm_out = mmap.mmap(fout2.fileno(), 0, access=mmap.ACCESS_WRITE)
+                    try:
+                        worker_count = _cpu_workers(workers)
 
-                if len(data) != orig_len:
-                    raise ValueError("Decompressed length mismatch")
+                        def job(rec):
+                            data_off, comp_len, out_off, orig_len = rec
+                            # copy compressed bytes (avoid exported-pointer ties)
+                            cview = mm_in[data_off:data_off+comp_len]
+                            cbytes = bytes(cview)  # copy
+                            t0 = time.perf_counter()
+                            data = decomp(cbytes)
+                            t1 = time.perf_counter()
+                            if len(data) != orig_len:
+                                raise ValueError("Decompressed length mismatch")
+                            return out_off, data, (t1 - t0), orig_len
 
-                f_out.write(data)
-                total_out += len(data)
+                        # Submit all jobs (bound inflight for memory)
+                        max_inflight = _cpu_workers(workers) * 2
+                        next_idx = 0
+                        in_flight: List = []
+                        total_written = 0
 
-                if verbose:
-                    dt = max(t1 - t0, 1e-9)
-                    mb = len(data) / (1024 * 1024)
-                    print(f"[decompress] chunk {idx:>4}: {_fmt_bytes(comp_len)} → {_fmt_bytes(len(data))} | {mb/dt:,.2f} MB/s")
-                idx += 1
+                        with ThreadPoolExecutor(max_workers=worker_count) as ex:
+                            # prime
+                            while next_idx < len(chunk_index) and len(in_flight) < max_inflight:
+                                in_flight.append(ex.submit(job, chunk_index[next_idx]))
+                                next_idx += 1
 
-        if total_out != orig_size:
-            raise ValueError(f"Size mismatch: expected {orig_size}, wrote {total_out}")
+                            while in_flight:
+                                for fut in as_completed(in_flight):
+                                    out_off, data, dt, o_len = fut.result()
+                                    # unordered write is fine; we write to the correct offset
+                                    mm_out[out_off:out_off+len(data)] = data
+                                    if verbose:
+                                        mb = o_len / (1024*1024)
+                                        thr = mb / max(dt, 1e-9)
+                                        # compute chunk ordinal (best-effort)
+                                        print(f"[decompress] chunk @+{out_off}: {_fmt_bytes(o_len)} | {thr:,.2f} MB/s")
+                                    total_written += len(data)
+                                    in_flight.remove(fut)
 
-# ---------------------------
-# Small helper for CLI/UX text
-# ---------------------------
+                                    # keep pipeline full
+                                    if next_idx < len(chunk_index):
+                                        in_flight.append(ex.submit(job, chunk_index[next_idx]))
+                                        next_idx += 1
+                        if total_written != orig_size:
+                            raise ValueError(f"Size mismatch: expected {orig_size}, wrote {total_written}")
+                    finally:
+                        mm_out.flush()
+                        mm_out.close()
+            finally:
+                mm_in.close()
 
+# Convenience for CLI messaging
 def detect_algo_name(level: str) -> str:
-    algo_id, _, _, _ = _choose_plan(level)
+    algo_id, _, _, _, _ = _plan_for(level, None, None)
     return ALGO_NAMES[algo_id]
 
