@@ -1,6 +1,6 @@
 [project]
 name = "warpcompress"
-version = "0.7.3"
+version = "0.7.4"
 description = "WarpCompress: adaptive, parallel (de)compression in pure Python with RAW/ZERO/LZ4/Snappy/Zstd per chunk, hybrid Zstd, and batched I/O."
 readme = "README.md"
 requires-python = ">=3.8"
