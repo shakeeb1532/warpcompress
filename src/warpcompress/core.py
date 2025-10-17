@@ -1,6 +1,6 @@
 # Copyright 2025
 """
-warpcompress.core
+warpcompress.core (v0.7.4)
 
 Pure-Python core for a simple "WARP" container:
 
@@ -12,9 +12,10 @@ Per-chunk header (CHDR):
   Followed by 'comp_len' payload bytes.
 
 Features:
-- Parallel chunk compression/decompression.
+- Parallel chunk compression/decompression with ordered writes.
 - Per-chunk codec choice (snappy/lz4/zstd/copy/zero).
 - Zero-block elision.
+- Auto chunk policy (size- and sparsity-aware) + tiny-input fast paths.
 - Pure Python I/O; optional C codecs for speed.
 """
 
@@ -58,9 +59,11 @@ ALGO_SNAPPY = 3
 ALGO_COPY   = 4
 ALGO_ZERO   = 5
 
-CHUNK_MIN = 256 * 1024
-CHUNK_DEF = 1 * 1024 * 1024
-CHUNK_MAX = 16 * 1024 * 1024
+# Chunk limits (bytes)
+CHUNK_MIN = 256 * 1024          # 256 KiB
+CHUNK_DEF = 1 * 1024 * 1024     # default if nothing else applies
+DEFAULT_CHUNK_MAX = 64 * 1024 * 1024  # 64 MiB default cap
+CHUNK_MAX = int(os.environ.get("WARP_CHUNK_MAX", DEFAULT_CHUNK_MAX))
 
 FHDR = struct.Struct("<4sBBII")  # magic, ver, flags, chunk_size, reserved
 CHDR = struct.Struct("<BII")     # algo, orig_len, comp_len
@@ -157,6 +160,92 @@ def detect_algo_name(algo: int) -> str:
     return m.get(int(algo), f"unknown({algo})")
 
 # ----------------------------
+# Auto-chunk policy (size & sparsity aware)
+# ----------------------------
+def _align_up(n: int, base: int) -> int:
+    return ((n + base - 1) // base) * base
+
+def _sample_zero_ratio(path: str, *, sample_window: int = 256 * 1024, max_windows: int = 3) -> float:
+    """
+    Estimate how 'zero-heavy' a file is by sampling up to 3 small windows:
+    start, middle, and end. Returns ratio in [0,1].
+    """
+    try:
+        size = os.path.getsize(path)
+        if size <= 0:
+            return 0.0
+        offs = [0]
+        if size > sample_window:
+            offs.append(max(0, (size // 2) - sample_window // 2))
+        if size > 2 * sample_window:
+            offs.append(max(0, size - sample_window))
+        offs = offs[:max_windows]
+        zeros = total = 0
+        with open(path, "rb") as f:
+            for off in offs:
+                f.seek(off)
+                chunk = f.read(sample_window)
+                if not chunk:
+                    continue
+                zeros += chunk.count(0)
+                total += len(chunk)
+        return (zeros / total) if total else 0.0
+    except Exception:
+        return 0.0
+
+def _policy_chunk_size(
+    file_size: int,
+    *,
+    requested: Optional[int],
+    level: str,
+    workers: int,
+    zero_ratio_hint: float | None = None,
+) -> int:
+    """
+    Rule-based policy for picking chunk size.
+
+    Goals:
+      - Tiny/small files: ~1–8 chunks total (reduce Python/syscall overhead).
+      - Medium/large files: scale chunk up to keep chunk count reasonable.
+      - Very sparse: bump to max to minimize header/syscall cost.
+      - Explicit --chunk always wins.
+    """
+    # 1) explicit override wins
+    if requested:
+        return _coerce_chunk_size(requested)
+
+    # 2) small-file bands (choose chunk to hit a target chunk count)
+    if file_size <= (2 * 1024**2):            # <= 2 MiB → 1 chunk
+        chunk = _align_up(file_size, 256 * 1024) or (256 * 1024)
+    elif file_size <= (8 * 1024**2):          # <= 8 MiB → ~2 chunks
+        chunk = _align_up((file_size + 1) // 2, 256 * 1024)
+    elif file_size <= (32 * 1024**2):         # <= 32 MiB → ~4–8 chunks
+        chunk = _align_up((file_size + 3) // 4, 512 * 1024)
+    elif file_size <= (128 * 1024**2):        # <= 128 MiB → ~8–16 chunks
+        chunk = _align_up((file_size + 7) // 8, 1 * 1024 * 1024)
+    else:
+        # 3) medium/large bands (clamped to CHUNK_MAX)
+        if file_size <= (1 * 1024**3):        # <= 1 GiB
+            chunk = 4 * 1024 * 1024
+        elif file_size <= (5 * 1024**3):      # <= 5 GiB
+            chunk = 8 * 1024 * 1024
+        elif file_size <= (10 * 1024**3):     # <= 10 GiB
+            chunk = 16 * 1024 * 1024
+        elif file_size <= (50 * 1024**3):     # <= 50 GiB
+            chunk = 32 * 1024 * 1024
+        elif file_size <= (100 * 1024**3):    # <= 100 GiB
+            chunk = 48 * 1024 * 1024
+        else:                                  # > 100 GiB
+            chunk = 64 * 1024 * 1024
+
+    # 4) very sparse -> prefer max
+    zr = zero_ratio_hint if zero_ratio_hint is not None else 0.0
+    if zr >= 0.90:
+        chunk = max(chunk, CHUNK_MAX)
+
+    return _coerce_chunk_size(chunk)
+
+# ----------------------------
 # Planning & codec choice
 # ----------------------------
 class Plan:
@@ -181,9 +270,9 @@ def _make_plan(level: str, *, chunk: Optional[int], workers: Optional[int],
     lz_acc = 4 if lvl in ("throughput", "lz4") else 1
     if verbose:
         base = "snappy" if lvl == "throughput" else lvl
-        print(f"Base hint: {base} (final codec is per-chunk adaptive)", flush=True)
+        print(f"Base hint: {base} (per-chunk adaptive)", flush=True)
         print(
-            f"INFO: base plan -> chunk={csize/1048576:.2f} MB (auto), "
+            f"INFO: base plan -> chunk={csize/1048576:.2f} MiB, "
             f"workers={w}, zstd_threads={zt}, lz4_accel={lz_acc}",
             flush=True,
         )
@@ -217,23 +306,6 @@ def _decomp_fn(algo: int) -> Callable[[bytes], bytes]:
     raise ValueError(f"Unknown algo {algo}")
 
 # ----------------------------
-# I/O helpers
-# ----------------------------
-def _write_fhdr(fout: io.BufferedWriter, chunk: int) -> None:
-    fout.write(FHDR.pack(MAGIC, VERSION, 0, chunk, 0))
-
-def _read_fhdr(fin: io.BufferedReader) -> Tuple[int, int]:
-    raw = fin.read(FHDR.size)
-    if len(raw) != FHDR.size:
-        raise ValueError("Invalid WARP header (truncated)")
-    magic, ver, _flags, chunk, _reserved = FHDR.unpack(raw)
-    if magic != MAGIC:
-        raise ValueError("Bad magic; not a warp file")
-    if ver not in (1, 2):
-        raise ValueError(f"Unsupported WARP version {ver}")
-    return ver, chunk
-
-# ----------------------------
 # Public API
 # ----------------------------
 def compress_file(
@@ -247,9 +319,38 @@ def compress_file(
     verbose: bool = False,
 ) -> None:
     """Compress input_filename into a Warp container at output_filename."""
-    plan = _make_plan(level, chunk=chunk, workers=workers, zstd_hybrid=zstd_hybrid, verbose=verbose)
+
+    # Compute workers early for policy use
+    w = _cpu_workers(workers)
+
+    # Auto-chunk policy (can be disabled via env)
+    auto_on = os.environ.get("WARP_AUTO_CHUNK", "1") not in ("0", "false", "False", "")
+    if auto_on:
+        try:
+            file_size = os.path.getsize(input_filename)
+        except Exception:
+            file_size = 0
+        zero_hint = _sample_zero_ratio(input_filename) if file_size > 0 else 0.0
+        chosen_chunk = _policy_chunk_size(
+            file_size,
+            requested=chunk,
+            level=level,
+            workers=w,
+            zero_ratio_hint=zero_hint,
+        )
+        if verbose:
+            print(
+                f"Policy: size={file_size}B zero≈{zero_hint:.2%} -> chunk={chosen_chunk/1048576:.1f} MiB",
+                flush=True,
+            )
+    else:
+        chosen_chunk = _coerce_chunk_size(chunk)
+
+    # Build plan using the chosen chunk
+    plan = _make_plan(level, chunk=chosen_chunk, workers=workers, zstd_hybrid=zstd_hybrid, verbose=verbose)
 
     with open(input_filename, "rb") as f_in, open(output_filename, "wb") as f_out:
+        # Write container header
         _write_fhdr(f_out, plan.chunk)
 
         # Prefer mmap for read parallelism
@@ -271,10 +372,9 @@ def compress_file(
             else:
                 return memoryview(f_in.read(plan.chunk))
 
+        # estimate block count
         blocks = math.ceil(total / plan.chunk) if use_mm and total else None
         zero_blocks = 0
-        next_idx = 0
-        pending = {}
 
         def job(i: int, blk: memoryview) -> Tuple[int, bytes]:
             algo, enc = _choose_alg(plan, blk)
@@ -286,10 +386,38 @@ def compress_file(
                 comp = enc(blk.tobytes())
             return i, CHDR.pack(algo, len(blk), len(comp)) + comp
 
+        # --- Tiny/low-chunk fast path (sequential, avoids thread overhead) ---
+        est_blocks = blocks
+        if est_blocks is None:
+            try:
+                fsz = os.path.getsize(input_filename)
+                est_blocks = max(1, (fsz + plan.chunk - 1) // plan.chunk)
+            except Exception:
+                est_blocks = 0
+
+        if (est_blocks and est_blocks <= 2) or (total and total <= (32 * 1024 * 1024)):
+            i = 0
+            while True:
+                blk = read_block(i)
+                if not blk:
+                    break
+                if _is_all_zero(blk):
+                    zero_blocks += 1
+                _idx, payload = job(i, blk)
+                f_out.write(payload)
+                i += 1
+            if verbose and zero_blocks:
+                print(f"[compress] (seq) 0+ zero x{zero_blocks}", flush=True)
+            return  # done, skip threaded path
+
+        # --- Threaded path ---
+        next_idx = 0
+        pending = {}
         with ThreadPoolExecutor(max_workers=plan.workers) as ex:
             futs = []
             if use_mm:
-                for i in range(blocks or 0):
+                blocks_mm = math.ceil(total / plan.chunk) if total else 0
+                for i in range(blocks_mm):
                     blk = read_block(i)
                     if not blk:
                         break
@@ -351,6 +479,27 @@ def decompress_file(
         offs[i] = offs[i - 1] + meta[i - 1][1]
     total_out = sum(m[1] for m in meta)
 
+    # --- Tiny/low-chunk fast path ---
+    if len(meta) <= 2 or total_out <= (32 * 1024 * 1024):
+        with open(output_filename, "wb") as f_out, open(input_filename, "rb") as fi:
+            try:
+                f_out.truncate(total_out)
+            except Exception:
+                pass
+            for i, (algo, orig, comp, payload_off) in enumerate(meta):
+                if algo == ALGO_ZERO:
+                    data = b"\x00" * orig
+                elif algo == ALGO_COPY:
+                    fi.seek(payload_off); data = fi.read(orig)
+                else:
+                    dec = _decomp_fn(algo)
+                    fi.seek(payload_off); payload = fi.read(comp)
+                    data = dec(payload)
+                f_out.seek(offs[i]); f_out.write(data)
+        if verbose:
+            print("[decompress] (seq) done", flush=True)
+        return
+
     # 3) Worker to decode a single chunk
     def djob(i: int, algo: int, orig: int, comp: int, payload_off: int) -> Tuple[int, bytes]:
         if algo == ALGO_ZERO:
@@ -387,3 +536,19 @@ def decompress_file(
     if verbose:
         print("[decompress] done", flush=True)
 
+# ----------------------------
+# I/O helpers (last to keep code tidy)
+# ----------------------------
+def _write_fhdr(fout: io.BufferedWriter, chunk: int) -> None:
+    fout.write(FHDR.pack(MAGIC, VERSION, 0, chunk, 0))
+
+def _read_fhdr(fin: io.BufferedReader) -> Tuple[int, int]:
+    raw = fin.read(FHDR.size)
+    if len(raw) != FHDR.size:
+        raise ValueError("Invalid WARP header (truncated)")
+    magic, ver, _flags, chunk, _reserved = FHDR.unpack(raw)
+    if magic != MAGIC:
+        raise ValueError("Bad magic; not a warp file")
+    if ver not in (1, 2):
+        raise ValueError(f"Unsupported WARP version {ver}")
+    return ver, chunk
