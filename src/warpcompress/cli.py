@@ -13,7 +13,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("output_file")
     c.add_argument("--level", choices=["throughput", "zstd", "lz4", "ratio"], default="throughput")
     c.add_argument("--workers", type=int, default=None)
-    c.add_argument("--chunk", type=int, default=None, help="Chunk size in bytes (256KiB..16MiB)")
+    c.add_argument("--chunk", type=int, default=None, help="Chunk size in bytes (min/max enforced)")
     c.add_argument("--zstd-hybrid", choices=["auto", "on", "off"], default="auto")
     c.add_argument("--verbose", action="store_true")
 
@@ -44,3 +44,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
