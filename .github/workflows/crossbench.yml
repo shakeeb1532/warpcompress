@@ -1,0 +1,129 @@
+name: Cross-platform Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes_mib:
+        description: "Test sizes in MiB (space-separated)"
+        default: "20 200 1024"
+        required: true
+      mix_pct:
+        description: "Mixed dataset percent random (0-100)"
+        default: "35"
+        required: true
+      workers:
+        description: "Workers/threads to use"
+        default: "8"
+        required: true
+
+jobs:
+  bench:
+    name: Bench (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Competitor tools
+      - name: Install competitor CLIs (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lz4 zstd pigz
+
+      - name: Install competitor CLIs (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install lz4 zstd pigz || true
+
+      - name: Install competitor CLIs (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          choco install -y lz4 zstandard pigz || echo "Some tools may be missing; bench will skip them."
+
+      - name: Install Python deps (warp + codecs)
+        run: |
+          python -m pip install -U pip
+          python -m pip install -U . zstandard lz4 python-snappy
+
+      # If bench.py isn't in repo, you can drop a fallback writer here (we already committed it)
+
+      - name: Make datasets (cross-platform, pure Python)
+        env:
+          SIZES: ${{ inputs.sizes_mib }}
+          MIX: ${{ inputs.mix_pct }}
+        run: |
+          python - <<'PY'
+import os, random
+def make_rand(path, mib):
+    with open(path,"wb") as f:
+        for _ in range(mib): f.write(os.urandom(1024*1024))
+def make_zero(path, mib):
+    with open(path,"wb") as f:
+        blk = b"\x00"* (1024*1024)
+        for _ in range(mib): f.write(blk)
+def make_mix(path, mib, pct):
+    with open(path,"wb") as f:
+        blk = b"\x00"* (1024*1024)
+        for _ in range(mib):
+            if random.randrange(100) < pct: f.write(os.urandom(1024*1024))
+            else: f.write(blk)
+sizes = [int(s) for s in os.environ.get("SIZES","20 200 1024").split()]
+mix = int(os.environ.get("MIX","35"))
+for mib in sizes:
+    make_rand(f"input-rand-{mib}M.bin", mib)
+    make_zero(f"input-zero-{mib}M.bin", mib)
+    make_mix(f"input-mixed-{mib}M.bin", mib, mix)
+print("datasets ready")
+PY
+
+      - name: Bench all datasets (warp + competitors + warp sweeps)
+        env:
+          WORKERS: ${{ inputs.workers }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CSV="results-${{ runner.os }}.csv"
+          echo "Writing to $CSV"
+          for f in input-*.bin; do
+            lvl="throughput"; [[ "$f" == input-zero-* ]] && lvl="zstd"
+            python bench.py "$f" --csv "$CSV" --workers "$WORKERS" --warp-level "$lvl"
+            for c in 4194304 8388608 16777216 33554432 50331648 67108864; do
+              python bench.py "$f" --csv "$CSV" --workers "$WORKERS" --warp-level "$lvl" --only "warp-$lvl" --warp-chunk $c
+            done
+          done
+          echo "CSV=$CSV" >> $GITHUB_ENV
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ runner.os }}
+          path: ${{ env.CSV }}
+
+      - name: Summarize results
+        run: |
+          python - <<'PY'
+import pandas as pd, os
+csv = os.environ["CSV"]
+df = pd.read_csv(csv)
+def ds(x): return str(x).split("/")[-1].replace(".bin","")
+df["dataset"] = df["input"].map(ds)
+sumc = (df.groupby(["dataset","tool"], as_index=False)
+          .agg(comp_MBps=("comp_MBps","max"),
+               decomp_MBps=("decomp_MBps","max"),
+               ratio=("ratio","median")))
+md = "### Best speeds by dataset & tool\n\n" + sumc.to_markdown(index=False)
+open(os.environ["GITHUB_STEP_SUMMARY"],"w").write(md)
+print(md)
+PY
