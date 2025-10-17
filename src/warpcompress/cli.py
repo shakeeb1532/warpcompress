@@ -1,6 +1,6 @@
 from __future__ import annotations
 import argparse
-from .core import compress_file, decompress_file, detect_algo_name  # detect is imported for CLI help/use
+from .core import compress_file, decompress_file
 from . import __version__
 
 def build_parser() -> argparse.ArgumentParser:
@@ -14,7 +14,6 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--level", choices=["throughput", "zstd", "lz4", "ratio"], default="throughput")
     c.add_argument("--workers", type=int, default=None)
     c.add_argument("--chunk", type=int, default=None, help="Chunk size in bytes (min/max enforced)")
-    c.add_argument("--zstd-hybrid", choices=["auto", "on", "off"], default="auto")
     c.add_argument("--verbose", action="store_true")
 
     d = sp.add_parser("decompress", help="Decompress a .warp file to raw")
@@ -33,7 +32,6 @@ def main(argv: list[str] | None = None) -> int:
             level=args.level,
             workers=args.workers,
             chunk=args.chunk,
-            zstd_hybrid=args.zstd_hybrid,
             verbose=args.verbose,
         )
         return 0
@@ -44,4 +42,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
