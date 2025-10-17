@@ -2,8 +2,7 @@
 WarpCompress package
 """
 __all__ = ["compress_file", "decompress_file", "detect_algo_name", "__version__"]
-
-__version__ = "0.7.4"
+__version__ = "0.7.5"
 
 from .core import compress_file, decompress_file, detect_algo_name
 
