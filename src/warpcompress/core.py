@@ -1,48 +1,27 @@
 # Copyright 2025
 """
-warpcompress.core (v0.7.4)
+warpcompress.core (v0.8.0)
 
-Pure-Python core for a simple "WARP" container:
+Pure-Python core for a simple "WARP" container with optional trailers:
+- WIX1: seekable index table for random access / fast open
+- WCHK: whole-file checksum trailer (xxh64 / blake3 / sha256)
+- WFTR: tiny footer pointing to WIX/WCHK offsets (so we don't scan)
 
-File header (FHDR):
-  MAGIC(4) | ver(u8) | flags(u8) | chunk_size(u32 LE) | reserved(u32 LE)
-
-Per-chunk header (CHDR):
-  algo(u8) | orig_len(u32 LE) | comp_len(u32 LE)
-  Followed by 'comp_len' payload bytes.
-
-Features:
-- Parallel chunk compression/decompression with ordered writes.
-- Per-chunk codec choice (snappy/lz4/zstd/copy/zero).
-- Zero-block elision.
-- Auto chunk policy (size- and sparsity-aware) + tiny-input fast paths.
-- Pure Python I/O; optional C codecs for speed.
-"""
-
-"""
-warpcompress.core (v0.7.5)
-
-Pure-Python core for a simple "WARP" container.
-
-Container layout
-----------------
-File header (FHDR):
-  MAGIC(4) | ver(u8) | flags(u8) | chunk_size(u32 LE) | reserved(u32 LE)
-
-Per-chunk header (CHDR):
-  algo(u8) | orig_len(u32 LE) | comp_len(u32 LE)
-  Followed by 'comp_len' payload bytes.
+Format (v2):
+  File header (FHDR):
+    MAGIC(4)='WARP' | ver(u8)=2 | flags(u8)=0 | chunk_size(u32 LE) | reserved(u32 LE)
+  Repeated chunks:
+    CHDR: algo(u8) | orig_len(u32 LE) | comp_len(u32 LE)
+    PAYLOAD: comp_len bytes (omitted for zero chunks)
+  Optional trailers (any order; discover via WFTR):
+    WIX1: "WIX1" | count(u32) | entries[count] | crc32(u32)
+          entry: payload_off(u64) | orig(u32) | comp(u32) | algo(u8)
+    WCHK: "WCHK" | algo(u8) | dlen(u8) | digest(dlen bytes)
+  Footer (always if any trailer present):
+    WFTR: "WFTR" | wix_off(u64) | wchk_off(u64)
 
 Algorithms:
-  1 = zstd, 2 = lz4, 3 = snappy, 4 = copy (no compression), 5 = zero (elide)
-
-This version focuses on speed:
-- Prefer LZ4 (block API) for --level throughput (faster than snappy on Apple Silicon)
-- Threaded zstd on compression
-- Single-syscall writes with os.writev (avoid header+payload concatenation)
-- Zero-copy COPY blocks (memoryview of the mmap slice)
-- Small-file fast path (<=32 MiB): one chunk, no thread pool
-- Simple incompressible heuristic to skip hopeless chunks
+  1 = zstd, 2 = lz4, 3 = snappy, 4 = copy (no compression), 5 = zero (all-zero chunk)
 """
 
 from __future__ import annotations
@@ -52,7 +31,7 @@ import mmap
 import math
 import struct
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import zlib
 from typing import Callable, List, Optional, Tuple
 
 # ----------------------------
@@ -60,24 +39,37 @@ from typing import Callable, List, Optional, Tuple
 # ----------------------------
 try:
     import zstandard as zstd  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     zstd = None  # type: ignore
 
 # Prefer lz4.block (lower overhead) but fall back to lz4.frame
 try:
     import lz4.block as lz4b  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     lz4b = None  # type: ignore
 
 try:
     import lz4.frame as lz4f  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     lz4f = None  # type: ignore
 
 try:
     import snappy as pysnappy  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     pysnappy = None  # type: ignore
+
+# Optional checksum libs
+try:
+    import xxhash as _xxh  # type: ignore
+except Exception:
+    _xxh = None  # type: ignore
+
+try:
+    import blake3 as _blake3  # type: ignore
+except Exception:
+    _blake3 = None  # type: ignore
+
+import hashlib
 
 # ----------------------------
 # Format constants
@@ -91,8 +83,17 @@ ALGO_SNAPPY = 3
 ALGO_COPY   = 4
 ALGO_ZERO   = 5
 
-FHDR = struct.Struct("<4sBBII")  # magic, ver, flags, chunk_size, reserved
-CHDR = struct.Struct("<BII")     # algo, orig_len, comp_len
+FHDR = struct.Struct("<4sBBII")   # magic, ver, flags, chunk_size, reserved
+CHDR = struct.Struct("<BII")      # algo, orig_len, comp_len
+
+# Trailers/footers
+WIX_MAGIC  = b"WIX1"
+WCHK_MAGIC = b"WCHK"
+WFTR_MAGIC = b"WFTR"
+
+WIX_HDR  = struct.Struct("<4sI")   # magic, count
+WIX_ENT  = struct.Struct("<QII B") # payload_off, orig, comp, algo
+WFTR     = struct.Struct("<4sQQ")  # magic, wix_off, wchk_off
 
 MiB = 1024 * 1024
 GiB = 1024 * MiB
@@ -105,11 +106,7 @@ CHUNK_MIN = 256 * 1024
 # ----------------------------
 # Small utilities
 # ----------------------------
-def _align_up(n: int, base: int) -> int:
-    return ((n + base - 1) // base) * base
-
 def _is_all_zero(mv: memoryview) -> bool:
-    """Fast-ish check without allocating; scan in steps and strip zeros."""
     step = 8192
     for i in range(0, len(mv), step):
         if mv[i:i+step].tobytes().strip(b"\x00"):
@@ -117,7 +114,6 @@ def _is_all_zero(mv: memoryview) -> bool:
     return True
 
 def _looks_incompressible(mv: memoryview) -> bool:
-    """Quick heuristic: sample <=16 KiB and check byte diversity."""
     n = min(len(mv), 16 * 1024)
     if n == 0:
         return False
@@ -136,19 +132,21 @@ def _cpu_workers(n: Optional[int]) -> int:
     c = os.cpu_count() or 4
     return min(max(2, c), 64)
 
+def _tell(fd: int) -> int:
+    return os.lseek(fd, 0, os.SEEK_CUR)
+
+def _write(fd: int, b: bytes | memoryview) -> None:
+    if isinstance(b, memoryview):
+        os.write(fd, b)
+    else:
+        os.write(fd, memoryview(b))
+
 def _writev(fd: int, parts) -> None:
-    """
-    Single-syscall write of multiple buffers when supported.
-    Falls back to sequential writes.
-    """
     try:
         os.writev(fd, [p if isinstance(p, memoryview) else memoryview(p) for p in parts])
     except (AttributeError, OSError):
         for p in parts:
-            if isinstance(p, memoryview):
-                os.write(fd, p)
-            else:
-                os.write(fd, memoryview(p))
+            _write(fd, p)
 
 # ----------------------------
 # TLS codec caches
@@ -162,14 +160,15 @@ def _tls_cache() -> dict:
         setattr(_tls, "_cache", c)
     return c
 
-def _zstd_c(level: int, threads: int):
+def _zstd_c(level: int, threads: int, dict_bytes: Optional[bytes] = None):
     if zstd is None:
         raise RuntimeError("zstandard not available")
     cache = _tls_cache()
-    key = ("zc", level, max(1, threads))
+    key = ("zc", level, max(1, threads), bool(dict_bytes))
     obj = cache.get(key)
     if obj is None:
-        obj = zstd.ZstdCompressor(level=level, threads=max(1, threads))
+        cd = zstd.ZstdCompressionDict(dict_bytes) if (dict_bytes and len(dict_bytes) > 0) else None
+        obj = zstd.ZstdCompressor(level=level, threads=max(1, threads), dict_data=cd)
         cache[key] = obj
     return obj.compress
 
@@ -187,7 +186,6 @@ def _zstd_d():
 def _lz4b_c(accel: int) -> Callable[[bytes], bytes]:
     if lz4b is None:
         raise RuntimeError("lz4.block not available")
-    # store_size=False since we already store orig_len in CHDR
     return lambda b: lz4b.compress(b, store_size=False, mode="default", acceleration=accel or 1)
 
 def _lz4b_d(uncompressed_size: int) -> Callable[[bytes], bytes]:
@@ -216,7 +214,7 @@ def _snappy_d() -> Callable[[bytes], bytes]:
     return pysnappy.decompress
 
 # ----------------------------
-# Helper used by the CLI
+# Header helpers
 # ----------------------------
 def detect_algo_name(algo: int) -> str:
     m = {
@@ -229,10 +227,9 @@ def detect_algo_name(algo: int) -> str:
     return m.get(int(algo), f"unknown({algo})")
 
 # ----------------------------
-# Auto-chunk policy (from your runs)
+# Auto-chunk policy (kept simple)
 # ----------------------------
 def _sample_zero_ratio(path: str, *, sample_window: int = 256 * 1024, max_windows: int = 3) -> float:
-    """Estimate zero fraction by sampling up to three small windows."""
     try:
         size = os.path.getsize(path)
         if size <= 0:
@@ -256,29 +253,11 @@ def _sample_zero_ratio(path: str, *, sample_window: int = 256 * 1024, max_window
     except Exception:
         return 0.0
 
-def _policy_chunk_size(
-    file_size: int,
-    *,
-    requested: Optional[int],
-    level: str,
-    workers: int,
-    zero_ratio_hint: float = 0.0,
-) -> int:
-    """
-    Choose chunk bytes. Tuned for Apple Silicon based on your data:
-    - <= 32 MiB: one chunk (avoid thread overhead)
-    - 32..128 MiB: 16 MiB
-    - 128..512 MiB: 32 MiB
-    - 512 MiB..2 GiB: 48 MiB (mixed ~1 GiB peaked around here)
-    - > 2 GiB: 64 MiB (cap)
-    - Very sparse (zstd level): keep larger chunks
-    """
+def _policy_chunk_size(file_size: int, *, requested: Optional[int], level: str, workers: int, zero_ratio_hint: float = 0.0) -> int:
     if requested:
         return _coerce_chunk_size(requested)
-
     if file_size <= 32 * MiB:
         return _coerce_chunk_size(file_size or 1 * MiB)
-
     if level == "zstd" and zero_ratio_hint >= 0.90:
         if file_size <= 256 * MiB:
             return _coerce_chunk_size(16 * MiB)
@@ -288,7 +267,6 @@ def _policy_chunk_size(
             return _coerce_chunk_size(48 * MiB)
         else:
             return _coerce_chunk_size(64 * MiB)
-
     if file_size <= 128 * MiB:
         return _coerce_chunk_size(16 * MiB)
     elif file_size <= 512 * MiB:
@@ -302,62 +280,62 @@ def _policy_chunk_size(
 # Planning & codec choice
 # ----------------------------
 class Plan:
-    __slots__ = ("level", "chunk", "workers", "zstd_threads", "lz4_accel", "verbose")
-    def __init__(self, level: str, *, chunk: int, workers: int, zstd_threads: int, lz4_accel: int, verbose: bool):
+    __slots__ = ("level", "chunk", "workers", "zstd_threads", "lz4_accel", "verbose",
+                 "checksum", "dict_bytes", "make_index")
+    def __init__(self, level: str, *, chunk: int, workers: int, zstd_threads: int, lz4_accel: int,
+                 verbose: bool, checksum: str, dict_bytes: Optional[bytes], make_index: bool):
         self.level = level
         self.chunk = chunk
         self.workers = workers
         self.zstd_threads = zstd_threads
         self.lz4_accel = lz4_accel
         self.verbose = verbose
+        self.checksum = checksum  # "none" | "xxh64" | "blake3" | "sha256"
+        self.dict_bytes = dict_bytes
+        self.make_index = make_index
 
-def _make_plan(level: str, *, chunk: Optional[int], workers: Optional[int], verbose: bool = False) -> Plan:
+def _make_plan(level: str, *, chunk: Optional[int], workers: Optional[int], verbose: bool = False,
+               checksum: str = "none", dict_bytes: Optional[bytes] = None, make_index: bool = False) -> Plan:
     lvl = (level or "throughput").lower()
     if lvl not in ("throughput", "zstd", "lz4", "ratio"):
         raise ValueError(f"Unknown level: {level}")
     csize = _coerce_chunk_size(chunk)
     w = _cpu_workers(workers)
-    # zstd threads: use workers for max parallelism
     zt = max(1, w)
-    # lz4 accel: mild acceleration for lz4 paths
     lz_acc = 1 if lvl in ("throughput", "lz4") else 0
+    cs = (checksum or "none").lower()
+    if cs not in ("none", "xxh64", "blake3", "sha256"):
+        raise ValueError(f"Unknown checksum: {checksum}")
     if verbose:
-        print(f"INFO: plan -> level={lvl}, chunk={csize/1048576:.1f} MiB, workers={w}, zstd_threads={zt}, lz4_accel={lz_acc}", flush=True)
-    return Plan(lvl, chunk=csize, workers=w, zstd_threads=zt, lz4_accel=lz_acc, verbose=verbose)
+        print(f"INFO: plan -> level={lvl}, chunk={csize/1048576:.1f} MiB, workers={w}, zstd_threads={zt}, index={make_index}, checksum={cs}", flush=True)
+    return Plan(lvl, chunk=csize, workers=w, zstd_threads=zt, lz4_accel=lz_acc, verbose=verbose,
+                checksum=cs, dict_bytes=dict_bytes, make_index=make_index)
 
 def _choose_compressor(plan: Plan, orig_len: int) -> Tuple[int, Callable[[bytes], bytes], Optional[Callable[[bytes], bytes]]]:
-    """
-    Return (algo_code, compress_fn, optional_decomp_provider)
-    Decompression provider is only needed for lz4.block (needs uncompressed_size).
-    """
     lvl = plan.level
     if lvl == "throughput":
-        # Prefer lz4.block
         if lz4b is not None:
-            return ALGO_LZ4, _lz4b_c(plan.lz4_accel), None  # decoder needs orig_len; handled in decomp path
+            return ALGO_LZ4, _lz4b_c(plan.lz4_accel), None
         if lz4f is not None:
             return ALGO_LZ4, _lz4f_c(plan.lz4_accel), _lz4f_d()
         if pysnappy is not None:
             return ALGO_SNAPPY, _snappy_c(), _snappy_d()
         if zstd is not None:
-            return ALGO_ZSTD, _zstd_c(1, plan.zstd_threads), _zstd_d()
+            return ALGO_ZSTD, _zstd_c(1, plan.zstd_threads, plan.dict_bytes), _zstd_d()
         return ALGO_COPY, (lambda b: b), None
-
     if lvl == "lz4":
         if lz4b is not None:
             return ALGO_LZ4, _lz4b_c(plan.lz4_accel), None
         if lz4f is not None:
             return ALGO_LZ4, _lz4f_c(plan.lz4_accel), _lz4f_d()
         return ALGO_COPY, (lambda b: b), None
-
     if lvl == "zstd":
         if zstd is not None:
-            return ALGO_ZSTD, _zstd_c(1, plan.zstd_threads), _zstd_d()
+            return ALGO_ZSTD, _zstd_c(1, plan.zstd_threads, plan.dict_bytes), _zstd_d()
         return ALGO_COPY, (lambda b: b), None
-
-    # ratio mode: zstd level 3 if available
+    # ratio mode
     if zstd is not None:
-        return ALGO_ZSTD, _zstd_c(3, plan.zstd_threads), _zstd_d()
+        return ALGO_ZSTD, _zstd_c(3, plan.zstd_threads, plan.dict_bytes), _zstd_d()
     return ALGO_COPY, (lambda b: b), None
 
 def _decomp_fn(algo: int, orig_len: int) -> Callable[[bytes], bytes]:
@@ -378,6 +356,65 @@ def _decomp_fn(algo: int, orig_len: int) -> Callable[[bytes], bytes]:
     raise ValueError(f"Unknown algo {algo}")
 
 # ----------------------------
+# Checksums (whole-file)
+# ----------------------------
+_CHK_NONE   = 0
+_CHK_XXH64  = 1
+_CHK_BLAKE3 = 2
+_CHK_SHA256 = 3
+
+class _Checksummer:
+    def __init__(self, algo: str):
+        a = algo.lower()
+        self.algo_name = a
+        self.code = _CHK_NONE
+        if a == "none":
+            self._h = None
+            self.code = _CHK_NONE
+        elif a == "xxh64":
+            if _xxh is not None:
+                self._h = _xxh.xxh64()
+                self.code = _CHK_XXH64
+            else:
+                self._h = hashlib.sha256()
+                self.code = _CHK_SHA256
+        elif a == "blake3":
+            if _blake3 is not None:
+                self._h = _blake3.blake3()
+                self.code = _CHK_BLAKE3
+            else:
+                self._h = hashlib.sha256()
+                self.code = _CHK_SHA256
+        elif a == "sha256":
+            self._h = hashlib.sha256()
+            self.code = _CHK_SHA256
+        else:
+            raise ValueError(a)
+
+    def update(self, b: bytes | memoryview):
+        if self._h is None:
+            return
+        if isinstance(b, memoryview):
+            self._h.update(b.tobytes())
+        else:
+            self._h.update(b)
+
+    def update_zeros(self, n: int):
+        if self._h is None or n <= 0:
+            return
+        blk = b"\x00" * (1 << 20)
+        while n > 0:
+            take = blk if n >= len(blk) else blk[:n]
+            self._h.update(take)
+            n -= len(take)
+
+    def digest(self) -> bytes:
+        if self._h is None:
+            return b""
+        # blake3 has .digest()
+        return self._h.digest()
+
+# ----------------------------
 # Public API
 # ----------------------------
 def compress_file(
@@ -388,6 +425,9 @@ def compress_file(
     workers: Optional[int] = None,
     chunk: Optional[int] = None,
     verbose: bool = False,
+    checksum: str = "none",
+    make_index: bool = False,
+    zstd_dict: Optional[bytes] = None,
 ) -> None:
     """Compress input_filename into a Warp container at output_filename."""
     # Workers (compute now for policy)
@@ -395,28 +435,18 @@ def compress_file(
 
     # Auto-chunk policy
     auto_on = os.environ.get("WARP_AUTO_CHUNK", "1") not in ("0", "false", "False", "")
-    if auto_on:
-        try:
-            file_size = os.path.getsize(input_filename)
-        except Exception:
-            file_size = 0
-        zero_hint = _sample_zero_ratio(input_filename) if file_size > 0 else 0.0
-        chosen_chunk = _policy_chunk_size(
-            file_size,
-            requested=chunk,
-            level=level,
-            workers=w,
-            zero_ratio_hint=zero_hint,
-        )
-        if verbose:
-            print(
-                f"Policy: size={file_size} bytes zero≈{zero_hint:.2%} -> chunk={chosen_chunk/1048576:.1f} MiB",
-                flush=True,
-            )
-    else:
-        chosen_chunk = _coerce_chunk_size(chunk)
+    try:
+        file_size = os.path.getsize(input_filename)
+    except Exception:
+        file_size = 0
+    zero_hint = _sample_zero_ratio(input_filename) if (auto_on and file_size > 0) else 0.0
+    chosen_chunk = _policy_chunk_size(file_size, requested=chunk, level=level, workers=w, zero_ratio_hint=zero_hint)
 
-    plan = _make_plan(level, chunk=chosen_chunk, workers=workers, verbose=verbose)
+    plan = _make_plan(level, chunk=chosen_chunk, workers=workers, verbose=verbose,
+                      checksum=checksum, dict_bytes=zstd_dict, make_index=make_index)
+
+    chk = _Checksummer(plan.checksum)
+    index_entries: List[Tuple[int, int, int, int]] = []  # (payload_off, orig, comp, algo)
 
     with open(input_filename, "rb") as f_in, open(output_filename, "wb", buffering=0) as f_out:
         out_fd = f_out.fileno()
@@ -434,124 +464,135 @@ def compress_file(
             total = 0
             use_mm = False
 
-        def get_block(i: int) -> memoryview:
+        # Iterate chunks sequentially (threading omitted here to keep index/checksum logic simple and robust)
+        # NOTE: threading is still used in 0.7.x; we can reintroduce parallel compress later with ordered writes.
+        offset = FHDR.size
+        i = 0
+        while True:
             if use_mm:
                 off = i * plan.chunk
                 end = min(off + plan.chunk, total)
                 if end <= off:
-                    return memoryview(b"")
-                return memoryview(mm)[off:end]
+                    break
+                blk = memoryview(mm)[off:end]
             else:
                 data = f_in.read(plan.chunk)
-                return memoryview(data) if data else memoryview(b"")
-
-        # Estimate blocks
-        if use_mm and total:
-            est_blocks = math.ceil(total / plan.chunk)
-        else:
-            # fallback: rough estimate
-            try:
-                fsz = os.path.getsize(input_filename)
-                est_blocks = max(1, (fsz + plan.chunk - 1) // plan.chunk)
-            except Exception:
-                est_blocks = 0
-
-        # Small/tiny fast path: write sequentially, no pool
-        if (est_blocks and est_blocks <= 2) or (total and total <= 32 * MiB):
-            i = 0
-            zero_blocks = 0
-            while True:
-                blk = get_block(i)
-                if not blk:
+                if not data:
                     break
-                if _is_all_zero(blk):
-                    zero_blocks += 1
-                    hdr = CHDR.pack(ALGO_ZERO, len(blk), 0)
-                    _writev(out_fd, (hdr,))
-                else:
-                    # incompressible short-circuit
-                    if _looks_incompressible(blk):
-                        hdr = CHDR.pack(ALGO_COPY, len(blk), len(blk))
-                        _writev(out_fd, (hdr, blk))
-                    else:
-                        algo, enc, _ = _choose_compressor(plan, len(blk))
-                        if algo == ALGO_COPY:
-                            hdr = CHDR.pack(ALGO_COPY, len(blk), len(blk))
-                            _writev(out_fd, (hdr, blk))
-                        else:
-                            comp = enc(blk.tobytes())
-                            hdr = CHDR.pack(algo, len(blk), len(comp))
-                            _writev(out_fd, (hdr, memoryview(comp)))
-                i += 1
-            if verbose and zero_blocks:
-                print(f"[compress] (seq) zero x{zero_blocks}", flush=True)
-            if use_mm:
-                mm.close()
-            return
+                blk = memoryview(data)
 
-        # Threaded path
-        zero_blocks = 0
-
-        def job(i: int, blk: memoryview):
-            """
-            Return per-chunk tuple for ordered write:
-              (i, algo, orig_len, comp_len, payload_memoryview_or_bytes)
-            """
             if _is_all_zero(blk):
-                return (i, ALGO_ZERO, len(blk), 0, b"")
-            if _looks_incompressible(blk):
-                # COPY block: zero-copy payload
-                return (i, ALGO_COPY, len(blk), len(blk), blk)
-            algo, enc, _ = _choose_compressor(plan, len(blk))
-            if algo == ALGO_COPY:
-                return (i, ALGO_COPY, len(blk), len(blk), blk)
-            comp = enc(blk.tobytes())
-            return (i, algo, len(blk), len(comp), comp)
-
-        next_idx = 0
-        pending = {}
-
-        with ThreadPoolExecutor(max_workers=plan.workers) as ex:
-            futs = []
-            if use_mm:
-                for i in range(est_blocks):
-                    blk = get_block(i)
-                    if not blk:
-                        break
-                    if _is_all_zero(blk):
-                        zero_blocks += 1  # for stats only
-                    futs.append(ex.submit(job, i, blk))
+                # zero chunk: no payload; update checksum and index
+                chk.update_zeros(len(blk))
+                hdr = CHDR.pack(ALGO_ZERO, len(blk), 0)
+                _write(out_fd, hdr)
+                payload_off = _tell(out_fd)  # payload starts after header; for zero it equals current
+                index_entries.append((payload_off, len(blk), 0, ALGO_ZERO))
+                offset += CHDR.size
             else:
-                i = 0
-                while True:
-                    blk = get_block(i)
-                    if not blk:
-                        break
-                    if _is_all_zero(blk):
-                        zero_blocks += 1
-                    futs.append(ex.submit(job, i, blk))
-                    i += 1
-
-            for fut in as_completed(futs):
-                idx, algo, orig_len, comp_len, payload = fut.result()
-                pending[idx] = (algo, orig_len, comp_len, payload)
-                while next_idx in pending:
-                    a, o, c, p = pending.pop(next_idx)
-                    hdr = CHDR.pack(a, o, c)
-                    if c == 0:
-                        _writev(out_fd, (hdr,))
+                # choose codec
+                if _looks_incompressible(blk):
+                    algo = ALGO_COPY
+                    comp_payload = blk  # zero-copy
+                else:
+                    algo, enc, _ = _choose_compressor(plan, len(blk))
+                    if algo == ALGO_COPY:
+                        comp_payload = blk
                     else:
-                        # COPY may carry a memoryview; others are bytes
-                        if isinstance(p, memoryview):
-                            _writev(out_fd, (hdr, p))
-                        else:
-                            _writev(out_fd, (hdr, memoryview(p)))
-                    next_idx += 1
+                        comp_payload = enc(blk.tobytes())
+                # checksum original
+                chk.update(blk)
 
-        if verbose and zero_blocks:
-            print(f"[compress] zero x{zero_blocks}", flush=True)
+                # index needs payload offset (after header)
+                cur = _tell(out_fd)
+                payload_off = cur + CHDR.size
+                if isinstance(comp_payload, memoryview):
+                    hdr = CHDR.pack(algo, len(blk), len(blk))
+                    _writev(out_fd, (hdr, comp_payload))
+                    comp_len = len(blk)
+                else:
+                    hdr = CHDR.pack(algo, len(blk), len(comp_payload))
+                    _writev(out_fd, (hdr, memoryview(comp_payload)))
+                    comp_len = len(comp_payload)
+
+                index_entries.append((payload_off, len(blk), comp_len, algo))
+                offset = payload_off + comp_len
+            i += 1
+
         if use_mm:
             mm.close()
+
+        # Trailers and footer
+        wix_off = 0
+        wchk_off = 0
+
+        if plan.make_index and index_entries:
+            buf = bytearray()
+            buf += WIX_HDR.pack(WIX_MAGIC, len(index_entries))
+            entries_bytes = bytearray()
+            for (poff, orig, comp, algo) in index_entries:
+                entries_bytes += WIX_ENT.pack(poff, orig, comp, algo)
+            crc = zlib.crc32(entries_bytes) & 0xFFFFFFFF
+            buf += entries_bytes
+            buf += struct.pack("<I", crc)
+            wix_off = _tell(out_fd)
+            _write(out_fd, buf)
+
+        if chk.code != _CHK_NONE:
+            dig = chk.digest()
+            wchk_off = _tell(out_fd)
+            _write(out_fd, WCHK_MAGIC + struct.pack("<BB", chk.code, len(dig)) + dig)
+
+        if wix_off or wchk_off:
+            _write(out_fd, WFTR.pack(WFTR_MAGIC, wix_off, wchk_off))
+
+def _read_footer_and_trailers(fi) -> tuple[list[tuple[int,int,int,int]] | None, tuple[int,int] | None]:
+    """
+    Return (index_entries or None, (chk_code, chk_len, chk_digest) or None)
+    """
+    # Try footer
+    try:
+        fi.seek(-WFTR.size, os.SEEK_END)
+        data = fi.read(WFTR.size)
+        if len(data) == WFTR.size:
+            magic, wix_off, wchk_off = WFTR.unpack(data)
+            if magic == WFTR_MAGIC:
+                idx = None
+                chk = None
+                if wix_off:
+                    fi.seek(wix_off)
+                    hdr = fi.read(WIX_HDR.size)
+                    mg, count = WIX_HDR.unpack(hdr)
+                    if mg == WIX_MAGIC:
+                        entries = []
+                        for _ in range(count):
+                            e = fi.read(WIX_ENT.size)
+                            po, orig, comp, algo = WIX_ENT.unpack(e)
+                            entries.append((po, orig, comp, algo))
+                        # ignore crc for now
+                        _ = fi.read(4)
+                        idx = entries
+                if wchk_off:
+                    fi.seek(wchk_off)
+                    mg = fi.read(4)
+                    if mg == WCHK_MAGIC:
+                        meta = fi.read(2)
+                        code, dlen = struct.unpack("<BB", meta)
+                        dig = fi.read(dlen)
+                        chk = (code, dlen, dig)
+                return idx, chk
+    except Exception:
+        pass
+    return None, None
+
+def _chk_from_code(code: int) -> _Checksummer:
+    if code == _CHK_XXH64:
+        return _Checksummer("xxh64")
+    if code == _CHK_BLAKE3:
+        return _Checksummer("blake3")
+    if code == _CHK_SHA256:
+        return _Checksummer("sha256")
+    return _Checksummer("none")
 
 def decompress_file(
     input_filename: str,
@@ -559,12 +600,12 @@ def decompress_file(
     *,
     workers: Optional[int] = None,
     verbose: bool = False,
+    verify: bool = False,
 ) -> None:
     """Decompress a WARP container to raw output."""
     w = _cpu_workers(workers)
 
-    # 1) Scan chunk table
-    meta: List[Tuple[int, int, int, int]] = []
+    # 0) Try indexed open via footer
     with open(input_filename, "rb") as f:
         raw = f.read(FHDR.size)
         if len(raw) != FHDR.size:
@@ -575,49 +616,49 @@ def decompress_file(
         if ver not in (1, 2):
             raise ValueError(f"Unsupported WARP version {ver}")
 
-        file_off = FHDR.size
-        while True:
-            hdr = f.read(CHDR.size)
-            if not hdr:
-                break
-            if len(hdr) != CHDR.size:
-                raise ValueError("Truncated container (chunk header)")
-            algo, orig_len, comp_len = CHDR.unpack(hdr)
-            payload_off = file_off + CHDR.size
-            meta.append((algo, orig_len, comp_len, payload_off))
-            f.seek(comp_len, io.SEEK_CUR)
-            file_off += CHDR.size + comp_len
+        idx, chk_meta = _read_footer_and_trailers(f)
 
-    # 2) Compute output offsets and total
+        if idx is None:
+            # fallback: linear scan
+            meta: List[Tuple[int, int, int, int]] = []
+            file_off = FHDR.size
+            while True:
+                hdr = f.read(CHDR.size)
+                if not hdr:
+                    break
+                if len(hdr) != CHDR.size:
+                    raise ValueError("Truncated container (chunk header)")
+                algo, orig_len, comp_len = CHDR.unpack(hdr)
+                payload_off = file_off + CHDR.size
+                meta.append((algo, orig_len, comp_len, payload_off))
+                f.seek(comp_len, io.SEEK_CUR)
+                file_off += CHDR.size + comp_len
+        else:
+            # fast path: translate index to meta tuples
+            meta = []
+            for (poff, orig, comp, algo) in idx:
+                meta.append((algo, orig, comp, poff))
+
+    # 1) Compute output offsets and total
     offs = [0] * len(meta)
     for i in range(1, len(meta)):
         offs[i] = offs[i - 1] + meta[i - 1][1]
     total_out = sum(m[1] for m in meta)
 
-    # 3) Tiny fast path: sequential
-    if len(meta) <= 2 or total_out <= 32 * MiB:
-        with open(output_filename, "wb", buffering=0) as f_out, open(input_filename, "rb") as fi:
-            try:
-                f_out.truncate(total_out)
-            except Exception:
-                pass
-            for i, (algo, orig, comp, payload_off) in enumerate(meta):
-                if algo == ALGO_ZERO:
-                    if orig > 0:
-                        f_out.write(b"\x00" * orig)
-                    continue
-                fi.seek(payload_off)
-                payload = fi.read(comp)
-                if algo == ALGO_COPY:
-                    f_out.write(payload)  # already raw
-                else:
-                    dec = _decomp_fn(algo, orig)
-                    f_out.write(dec(payload))
-        if verbose:
-            print("[decompress] (seq) done", flush=True)
-        return
+    # 2) Prepare checksum (if verify and trailer present)
+    chk = None
+    want_digest = None
+    if verify:
+        if 'chk_meta' in locals() and chk_meta:
+            code, dlen, dig = chk_meta
+            chk = _chk_from_code(code)
+            want_digest = dig
+        else:
+            # no stored checksum; we can still proceed without verification
+            chk = _Checksummer("none")
 
-    # 4) Parallel decode; ordered write
+    # 3) Parallel decode; ordered write (simple threadpool)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     pending = {}
     next_idx = 0
 
@@ -641,13 +682,27 @@ def decompress_file(
         futures = {ex.submit(djob, i, *m): i for i, m in enumerate(meta)}
         while futures:
             fut = next(as_completed(futures))
-            idx, data = fut.result()
-            del futures[fut]
-            pending[idx] = data
+            idx = futures.pop(fut)
+            i, data = fut.result()
+            pending[i] = data
             while next_idx in pending:
+                chunk_bytes = pending.pop(next_idx)
+                # checksum (if needed)
+                if chk:
+                    if meta[next_idx][0] == ALGO_ZERO:
+                        chk.update_zeros(len(chunk_bytes))
+                    else:
+                        chk.update(chunk_bytes)
                 f_out.seek(offs[next_idx])
-                f_out.write(pending.pop(next_idx))
+                f_out.write(chunk_bytes)
                 next_idx += 1
 
+    # 4) Verify digest
+    if verify and want_digest is not None and chk:
+        have = chk.digest()
+        if have != want_digest:
+            raise ValueError("Checksum verification failed")
     if verbose:
         print("[decompress] done", flush=True)
+
+
