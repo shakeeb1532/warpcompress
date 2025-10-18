@@ -1,12 +1,13 @@
 [project]
 name = "warpcompress"
-version = "0.7.5"
+version = "0.8.0"
 description = "WarpCompress: adaptive, parallel (de)compression in pure Python with RAW/ZERO/LZ4/Snappy/Zstd per chunk, hybrid Zstd, and batched I/O."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "Shakeeb", email = "you@example.com" }]
+authors = [{ name = "Shakeeb", email = "shakeeb1532@gmail.com" }
 
+# Core runtime deps (keep as-is so users get speed by default)
 dependencies = [
   "python-snappy>=0.7.1",
   "lz4>=4.3.2",
@@ -15,7 +16,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-hashes = ["xxhash>=3.0.0"]
+# Enables --checksum blake3 and xxh64 (WCHK trailer + --verify)
+hashes = [
+  "xxhash>=3.4.1",
+  "blake3>=0.4.1",
+]
 
 [project.scripts]
 warp-compress = "warpcompress.cli:main"
@@ -23,5 +28,6 @@ warp-compress = "warpcompress.cli:main"
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
 
 
