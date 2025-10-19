@@ -1,39 +1,18 @@
 name: Publish to PyPI
-
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch: {}
-
+    tags: [ 'v*' ]
 permissions:
+  id-token: write
   contents: read
-  id-token: write   # Needed for PyPI Trusted Publishing (OIDC)
-
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Build package (sdist & wheel)
-        run: |
-          python -m pip install -U pip build
-          python -m build
-
-      - name: Verify metadata (optional but helpful)
-        run: |
-          python -m pip install -U twine
-          python -m twine check dist/*
-
-      - name: Publish to PyPI (Trusted Publisher)
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: python -m pip install -U pip build
+      - run: python -m build
+      - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          print-hash: true
