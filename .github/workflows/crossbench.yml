@@ -29,9 +29,23 @@ jobs:
         with:
           python-version: ${{ matrix.py }}
 
-      - name: Install package (with checksum extras)
+      # ---- OS deps (snappy, lz4, zstd) ----
+      - name: Linux apt deps
+        if: runner.os == 'Linux'
         run: |
-          python -m pip install -U pip
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsnappy-dev libzstd-dev liblz4-dev
+
+      - name: macOS brew deps
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install snappy zstd lz4 || true
+
+      - name: Install package (+checksum extras)
+        run: |
+          python -m pip install -U pip wheel
           python -m pip install -U ".[hashes]"
 
       - name: Show versions
@@ -66,9 +80,9 @@ jobs:
               with open(p,'rb') as f:
                   for b in iter(lambda:f.read(1<<20), b''):
                       m.update(b)
-              print(p, m.hexdigest())
               return m.hexdigest()
-          assert h('input-rand-20M.bin') == h('round.bin')
+          a=h('input-rand-20M.bin'); b=h('round.bin')
+          print('input',a); print('round',b)
+          assert a==b, "hash mismatch"
           print('OK: hashes match')
           PY
-
